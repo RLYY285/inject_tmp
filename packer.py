@@ -18,24 +18,24 @@ from pathlib import Path
 import lief
 
 # ================= Magic values (must match delete.c) =================
-MAGIC64_OEP       = 0x1111111122222222
-MAGIC64_TEXT_ADDR = 0x3333333344444444
-MAGIC64_TEXT_SIZE = 0x5555555566666666
-MAGIC64_VOFFSET   = 0x7777777788888888
-MAGIC64_TEXT_OFF  = 0x99999999AAAABBBB
-MAGIC64_RETAIN_INTERVAL = 0xAAAAAAAA11111111
-MAGIC64_DELETE_SIZE     = 0xBBBBBBBB22222222
-MAGIC64_TOTAL_BLOCKS    = 0xCCCCCCCC33333333
+MAGIC64_OEP              = 0x1111111122222222
+MAGIC64_VOFFSET          = 0x7777777788888888
+MAGIC64_REGION_COUNT     = 0xEEEEEEEE44444444
+MAGIC64_REGION_ADDR      = 0x3333333344444444
+MAGIC64_REGION_SIZE      = 0x5555555566666666
+MAGIC64_RETAIN_INTERVAL  = 0xAAAAAAAA11111111
+MAGIC64_DELETE_SIZE      = 0xBBBBBBBB22222222
+MAGIC64_TOTAL_BLOCKS     = 0xCCCCCCCC33333333
 MAGIC64_CONVEX_MIN_VADDR = 0xEEEEEEEE66666666
 
-MAGIC32_OEP       = 0x22222222
-MAGIC32_TEXT_ADDR = 0x44444444
-MAGIC32_TEXT_SIZE = 0x66666666
-MAGIC32_VOFFSET   = 0x88888888
-MAGIC32_TEXT_OFF  = 0xAAAABBBB
-MAGIC32_RETAIN_INTERVAL = 0x11111111
-MAGIC32_DELETE_SIZE     = 0x55555555
-MAGIC32_TOTAL_BLOCKS    = 0x77777777
+MAGIC32_OEP              = 0x22222222
+MAGIC32_VOFFSET          = 0x88888888
+MAGIC32_REGION_COUNT     = 0xEEEE4444
+MAGIC32_REGION_ADDR      = 0x44444444
+MAGIC32_REGION_SIZE      = 0x66666666
+MAGIC32_RETAIN_INTERVAL  = 0x11111111
+MAGIC32_DELETE_SIZE      = 0x55555555
+MAGIC32_TOTAL_BLOCKS     = 0x77777777
 MAGIC32_CONVEX_MIN_VADDR = 0xEEEE6666
 
 TARGET_FILE = "target.elf"
@@ -83,26 +83,26 @@ ARCH_SPECS = {
 }
 
 MAGIC_MAP_64 = {
-    'OEP_ADDR': MAGIC64_OEP,
-    'TEXT_ADDR': MAGIC64_TEXT_ADDR,
-    'TEXT_SIZE': MAGIC64_TEXT_SIZE,
-    'TEXT_OFFSET': MAGIC64_TEXT_OFF,
-    'STUB_VOFFSET': MAGIC64_VOFFSET,
+    'OEP_ADDR':        MAGIC64_OEP,
+    'STUB_VOFFSET':    MAGIC64_VOFFSET,
+    'REGION_COUNT':    MAGIC64_REGION_COUNT,
+    'REGION_ADDR':     MAGIC64_REGION_ADDR,
+    'REGION_SIZE':     MAGIC64_REGION_SIZE,
     'RETAIN_INTERVAL': MAGIC64_RETAIN_INTERVAL,
-    'DELETE_SIZE': MAGIC64_DELETE_SIZE,
-    'TOTAL_BLOCKS': MAGIC64_TOTAL_BLOCKS,
+    'DELETE_SIZE':     MAGIC64_DELETE_SIZE,
+    'TOTAL_BLOCKS':    MAGIC64_TOTAL_BLOCKS,
     'CONVEX_MIN_VADDR': MAGIC64_CONVEX_MIN_VADDR,
 }
 
 MAGIC_MAP_32 = {
-    'OEP_ADDR': MAGIC32_OEP,
-    'TEXT_ADDR': MAGIC32_TEXT_ADDR,
-    'TEXT_SIZE': MAGIC32_TEXT_SIZE,
-    'TEXT_OFFSET': MAGIC32_TEXT_OFF,
-    'STUB_VOFFSET': MAGIC32_VOFFSET,
+    'OEP_ADDR':        MAGIC32_OEP,
+    'STUB_VOFFSET':    MAGIC32_VOFFSET,
+    'REGION_COUNT':    MAGIC32_REGION_COUNT,
+    'REGION_ADDR':     MAGIC32_REGION_ADDR,
+    'REGION_SIZE':     MAGIC32_REGION_SIZE,
     'RETAIN_INTERVAL': MAGIC32_RETAIN_INTERVAL,
-    'DELETE_SIZE': MAGIC32_DELETE_SIZE,
-    'TOTAL_BLOCKS': MAGIC32_TOTAL_BLOCKS,
+    'DELETE_SIZE':     MAGIC32_DELETE_SIZE,
+    'TOTAL_BLOCKS':    MAGIC32_TOTAL_BLOCKS,
     'CONVEX_MIN_VADDR': MAGIC32_CONVEX_MIN_VADDR,
 }
 
@@ -359,29 +359,33 @@ def build_convex_hull_content(binary: lief.ELF.Binary,
                                insert_type: str,
                                arch_name: str) -> tuple[bytes, dict]:
     """
-    构建凸包内容：污染后的原始 PT_LOAD 数据（连续存放）
-    
+    构建凸包内容：污染后的原始 PT_LOAD 数据（按虚拟地址偏移放置）
+
+    布局：每个原始 LOAD 段的污染数据写入其相对于 min_vaddr 的偏移处。
+    若污染后的数据超出当前段在虚拟地址空间中的范围，将使段间产生重叠，
+    函数会检测并报告此情况。
+
     返回：(凸包内容, 段信息映射)
     """
     convex_content = bytearray()
     min_vaddr = convex_info['min_vaddr']
-    
+
     # 记录每个段的信息
     segment_info = {}
-    
+
     # 对每个原始 PT_LOAD，按虚拟地址顺序处理
-    segments_sorted = sorted(convex_info['segments'], 
+    segments_sorted = sorted(convex_info['segments'],
                              key=lambda x: x[1].virtual_address)
-    
-    for seg_idx, seg in segments_sorted:
+
+    for list_pos, (seg_idx, seg) in enumerate(segments_sorted):
         # 计算这个段在凸包内的偏移
         seg_offset_in_convex = seg.virtual_address - min_vaddr
-        
+
         # 提取原始数据
         seg_file_start = seg.file_offset
         seg_file_end = seg_file_start + seg.physical_size
         original_data = file_bytes[seg_file_start:seg_file_end]
-        
+
         # 污染数据
         polluted_data, total_blocks = build_polluted_text(
             original_data,
@@ -390,26 +394,134 @@ def build_convex_hull_content(binary: lief.ELF.Binary,
             insert_type,
             arch_name
         )
-        
+
+        polluted_size = len(polluted_data)
+
+        # 检查污染数据是否溢出到下一个段的虚拟地址空间
+        if list_pos + 1 < len(segments_sorted):
+            next_seg = segments_sorted[list_pos + 1][1]
+            next_offset = next_seg.virtual_address - min_vaddr
+            if seg_offset_in_convex + polluted_size > next_offset:
+                overflow = seg_offset_in_convex + polluted_size - next_offset
+                raise RuntimeError(
+                    f"[-] 段 {list_pos} (vaddr={hex(seg.virtual_address)}) 的污染数据"
+                    f"超出其虚拟地址范围 {overflow} 字节，"
+                    f"与段 {list_pos + 1} (vaddr={hex(next_seg.virtual_address)}) 重叠。"
+                    f"请减小 --insert-size 或增大 --block-size。"
+                )
+
         # 确保凸包内容足够大
-        needed_size = seg_offset_in_convex + len(polluted_data)
+        needed_size = seg_offset_in_convex + polluted_size
         if len(convex_content) < needed_size:
             convex_content.extend(b'\x00' * (needed_size - len(convex_content)))
-        
+
         # 写入污染数据
         convex_content[seg_offset_in_convex:needed_size] = polluted_data
-        
-        # 记录段信息
+
+        # 记录段信息（含验证所需的原始数据元数据）
         segment_info[seg_idx] = {
             'vaddr': seg.virtual_address,
             'size': seg.physical_size,
-            'polluted_size': len(polluted_data),
+            'polluted_size': polluted_size,
             'blocks': total_blocks,
             'block_size': block_size,
             'insert_size': insert_size,
+            # 验证用元数据
+            '_orig_file_start': seg_file_start,
+            '_polluted_data': bytes(polluted_data),
         }
-    
+
     return bytes(convex_content), segment_info
+
+
+def write_convex_elf(output_path: Path,
+                     combined_content: bytearray,
+                     convex_vaddr: int,
+                     convex_virtual_size: int,
+                     stub_entry_vaddr: int,
+                     is64: bool) -> None:
+    """
+    手动构建并写出凸包 ELF 文件。
+
+    避免使用 LIEF 写出 ELF（LIEF 在某些二进制文件上无法正确重定位 PHT），
+    直接构造 ELF 头 + 单个 PT_LOAD 程序头 + 内容。
+
+    布局（文件）：
+      [ELF header][PT_LOAD phdr][pad to PAGE_SIZE][combined_content]
+    """
+    PAGE_SIZE = 0x1000
+
+    if is64:
+        ELF_HDR_SIZE  = 64
+        PHDR_ENT_SIZE = 56
+        e_machine     = 62    # EM_X86_64
+        e_class       = 2     # ELFCLASS64
+        elf_fmt       = '<4sBBBBBxxxxxxx'   # e_ident (16 bytes)
+        ehdr_fmt      = '<HHIQQQIHHHHHH'     # remaining ELF header fields
+        phdr_fmt      = '<IIQQQQQQ'          # 64-bit phdr
+        e_type        = 2     # ET_EXEC (non-PIE default)
+    else:
+        ELF_HDR_SIZE  = 52
+        PHDR_ENT_SIZE = 32
+        e_machine     = 3     # EM_386
+        e_class       = 1     # ELFCLASS32
+        elf_fmt       = '<4sBBBBBxxxxxxx'
+        ehdr_fmt      = '<HHIIIIIHHHHHH'
+        phdr_fmt      = '<IIIIIIII'
+        e_type        = 2
+
+    e_phoff   = ELF_HDR_SIZE
+    e_phnum   = 1
+    # Content starts at the first page after the header + single phdr
+    hdr_total = ELF_HDR_SIZE + PHDR_ENT_SIZE
+    content_file_offset = align_up(hdr_total, PAGE_SIZE)
+    header_pad = content_file_offset - hdr_total
+
+    p_type  = 1          # PT_LOAD
+    p_flags = 7          # R | W | X
+    p_offset = content_file_offset
+    p_vaddr  = convex_vaddr
+    p_paddr  = convex_vaddr
+    p_filesz = len(combined_content)
+    p_memsz  = convex_virtual_size
+    p_align  = PAGE_SIZE
+
+    # Build ELF ident (16 bytes)
+    # Fields: EI_CLASS, EI_DATA (1=ELFDATA2LSB), EI_VERSION (1=current), EI_OSABI (0=SysV), EI_ABIVERSION (0)
+    elf_ident = struct.pack(elf_fmt, b'\x7fELF', e_class, 1, 1, 0, 0)  # 16 bytes
+
+    if is64:
+        ehdr_body = struct.pack(ehdr_fmt,
+            e_type, e_machine, 1,           # type, machine, version
+            stub_entry_vaddr,               # e_entry
+            e_phoff, 0, 0,                  # e_phoff, e_shoff, e_flags
+            ELF_HDR_SIZE,                   # e_ehsize
+            PHDR_ENT_SIZE, e_phnum,         # e_phentsize, e_phnum
+            0, 0, 0,                        # e_shentsize, e_shnum, e_shstrndx
+        )
+        phdr_data = struct.pack(phdr_fmt,
+            p_type, p_flags,
+            p_offset, p_vaddr, p_paddr,
+            p_filesz, p_memsz, p_align,
+        )
+    else:
+        ehdr_body = struct.pack(ehdr_fmt,
+            e_type, e_machine, 1,
+            stub_entry_vaddr & 0xFFFFFFFF,
+            e_phoff, 0, 0,
+            ELF_HDR_SIZE,
+            PHDR_ENT_SIZE, e_phnum,
+            0, 0, 0,
+        )
+        phdr_data = struct.pack(phdr_fmt,
+            p_type, p_offset,
+            p_vaddr & 0xFFFFFFFF, p_paddr & 0xFFFFFFFF,
+            p_filesz & 0xFFFFFFFF, p_memsz & 0xFFFFFFFF,
+            p_flags, p_align & 0xFFFFFFFF,
+        )
+
+    out = elf_ident + ehdr_body + phdr_data + bytes(header_pad) + bytes(combined_content)
+    output_path.write_bytes(out)
 
 
 def create_convex_hull_elf(source_path: Path,
@@ -418,74 +530,96 @@ def create_convex_hull_elf(source_path: Path,
                            convex_content: bytes,
                            stub_entry_offset: int,
                            stub_blob: bytes,
-                           is64: bool) -> lief.ELF.Binary:
+                           is64: bool,
+                           temp_file: Path) -> tuple[int, int, int, int]:
     """
-    创建凸包 ELF：
-    1. 克隆原始 ELF
-    2. 移除所有原始 PT_LOAD
-    3. 创建单一凸包 PT_LOAD
-    4. 保留其他段（PT_DYNAMIC, PT_INTERP 等）
-    5. 更新 entrypoint
+    创建凸包 ELF 并写入 temp_file。
+
+    布局分两种情况：
+      - 标准布局（非 PIE / min_vaddr >= stub_pad）：
+          [Stub | Pad] | [原始 LOAD 数据（按原始虚拟地址偏移）]
+          凸包起始地址 = min_vaddr - stub_pad，原始段地址不变
+      - 后置布局（PIE / min_vaddr < stub_pad）：
+          [原始 LOAD 数据（按原始虚拟地址偏移）] | [Pad] | [Stub]
+          凸包起始地址 = min_vaddr，Stub 追加于原始数据之后
+
+    使用 write_convex_elf 手动构建 ELF，确保虚拟地址精确（避免 LIEF 重定位问题）。
+
+    返回: (stub_pad, stub_offset_in_combined, convex_vaddr, content_file_offset)
+      - stub_pad:              Stub 占用的页对齐字节数
+      - stub_offset_in_combined: Stub blob 在 combined_content 中的字节偏移
+      - convex_vaddr:          凸包 PT_LOAD 的起始虚拟地址
+      - content_file_offset:   combined_content 在输出文件中的字节偏移
     """
-    # LIEF Binary 对象不可 deepcopy（内部不可 pickle），改为重新 parse 一份独立对象
-    new_binary = lief.parse(str(source_path))
-    if not new_binary:
-        raise RuntimeError(f"[-] 无法重新解析 ELF: {source_path}")
-    
-    # 移除所有原始 PT_LOAD 段
-    new_binary.remove(lief.ELF.Segment.TYPE.LOAD)
-    
-    # 创建凸包 PT_LOAD
-    convex_seg = lief.ELF.Segment()
-    convex_seg.type = lief.ELF.Segment.TYPE.LOAD
-    convex_seg.flags = (lief.ELF.Segment.FLAGS.R | 
-                        lief.ELF.Segment.FLAGS.W | 
-                        lief.ELF.Segment.FLAGS.X)
-    convex_seg.virtual_address = convex_info['min_vaddr']
-    convex_seg.physical_address = convex_info['min_vaddr']
-    convex_seg.virtual_size = convex_info['size']
-    
-    # 内容 = Stub + 污染数据
-    combined_content = stub_blob + convex_content
-    convex_seg.physical_size = len(combined_content)
-    convex_seg.alignment = 0x1000
-    convex_seg.content = combined_content
-    
-    # 添加凸包段
-    new_binary.add(convex_seg)
-    
-    # 更新 entrypoint
-    stub_vaddr = convex_info['min_vaddr'] + stub_entry_offset
-    new_binary.header.entrypoint = stub_vaddr
-    
-    return new_binary
+    PAGE_SIZE = 0x1000
+
+    stub_pad = align_up(len(stub_blob), PAGE_SIZE)
+    min_vaddr = convex_info['min_vaddr']
+
+    if min_vaddr >= stub_pad:
+        # 标准布局：Stub 在原始数据之前
+        convex_vaddr = min_vaddr - stub_pad
+        stub_padding = bytes(stub_pad - len(stub_blob))
+        combined_content = (bytearray(stub_blob) + bytearray(stub_padding) +
+                            bytearray(convex_content))
+        convex_virtual_size = stub_pad + max(convex_info['size'], len(convex_content))
+        stub_offset_in_combined = 0
+    else:
+        # 后置布局（PIE / min_vaddr 过小）：Stub 追加于原始数据之后
+        convex_vaddr = min_vaddr
+        data_aligned = align_up(len(convex_content), PAGE_SIZE)
+        data_padding = bytes(data_aligned - len(convex_content))
+        stub_padding = bytes(stub_pad - len(stub_blob))
+        combined_content = (bytearray(convex_content) + bytearray(data_padding) +
+                            bytearray(stub_blob) + bytearray(stub_padding))
+        convex_virtual_size = data_aligned + stub_pad
+        stub_offset_in_combined = data_aligned
+
+    stub_entry_vaddr = convex_vaddr + stub_offset_in_combined + stub_entry_offset
+
+    # 使用手动构建函数写出文件，确保虚拟地址精确
+    write_convex_elf(
+        temp_file,
+        combined_content,
+        convex_vaddr,
+        convex_virtual_size,
+        stub_entry_vaddr,
+        is64,
+    )
+
+    # content_file_offset: combined_content 在文件中的偏移
+    ELF_HDR_SIZE  = 64 if is64 else 52
+    PHDR_ENT_SIZE = 56 if is64 else 32
+    content_file_offset = align_up(ELF_HDR_SIZE + PHDR_ENT_SIZE, PAGE_SIZE)
+
+    return stub_pad, stub_offset_in_combined, convex_vaddr, content_file_offset
 
 
-def _patch_convex_hull_stub(temp_file: Path,
-                           output_file: Path,
-                           temp_bin: lief.ELF.Binary,
+
+
+def _patch_convex_hull_stub(output_file: Path,
                            is64: bool,
                            convex_info: dict,
                            segment_info: dict,
-                           stub_symbol_offsets: dict[str, int]):
+                           stub_symbol_offsets: dict[str, int],
+                           original_oep: int,
+                           stub_pad: int,
+                           stub_offset_in_combined: int,
+                           content_file_offset: int):
     """
     在凸包 ELF 中打补丁
+
+    参数：
+      original_oep:          原始 ELF 的入口点虚拟地址（运行时恢复后的跳转目标）
+      stub_pad:              Stub 在凸包中占用的页对齐字节数
+      stub_offset_in_combined: Stub blob 在组合内容（combined_content）中的字节偏移
+      content_file_offset:   combined_content 在输出文件中的字节偏移
     """
     width = 8 if is64 else 4
-    
-    # 找到凸包 PT_LOAD（应该是第一个 LOAD 段）
-    convex_seg = None
-    for seg in temp_bin.segments:
-        if (seg.type == lief.ELF.Segment.TYPE.LOAD and
-            seg.virtual_address == convex_info['min_vaddr']):
-            convex_seg = seg
-            break
-    
-    if not convex_seg:
-        raise RuntimeError("[-] 无法找到凸包 PT_LOAD")
-    
-    stub_file_start = int(convex_seg.file_offset)
-    
+
+    # stub 在文件中的起始偏移 = combined_content 的文件偏移 + stub 在 combined 中的偏移
+    stub_file_start = content_file_offset + stub_offset_in_combined
+
     def stub_file_off(symbol: str, idx: int | None = None) -> int:
         if symbol not in stub_symbol_offsets:
             raise RuntimeError(f"[-] Stub 符号未找到: {symbol}")
@@ -493,53 +627,60 @@ def _patch_convex_hull_stub(temp_file: Path,
         if idx is not None:
             off += idx * width
         return off
-    
+
     # 打补丁
     print('    打补丁...')
-    
+
     try:
-        # CONVEX_MIN_VADDR
-        patch_value(output_file, stub_file_off("CONVEX_MIN_VADDR"), 
+        # CONVEX_MIN_VADDR：原始段的最小虚拟地址（原始数据起始位置）
+        patch_value(output_file, stub_file_off("CONVEX_MIN_VADDR"),
                     convex_info['min_vaddr'], width)
         print(f'      CONVEX_MIN_VADDR = {hex(convex_info["min_vaddr"])}')
-        
-        # OEP_ADDR
-        patch_value(output_file, stub_file_off("OEP_ADDR"), 
-                    convex_info['min_vaddr'], width)
-        print(f'      OEP_ADDR = {hex(convex_info["min_vaddr"])}')
-        
+
+        # OEP_ADDR：原始 ELF 入口点（恢复后跳转的目标地址）
+        patch_value(output_file, stub_file_off("OEP_ADDR"),
+                    original_oep, width)
+        print(f'      OEP_ADDR = {hex(original_oep)}')
+
+        # STUB_VOFFSET：stub 在凸包中的偏移（即 stub_pad）
+        patch_value(output_file, stub_file_off("STUB_VOFFSET"),
+                    stub_pad, width)
+        print(f'      STUB_VOFFSET = {hex(stub_pad)}')
+
         # REGION_COUNT
-        patch_value(output_file, stub_file_off("REGION_COUNT"), 
+        patch_value(output_file, stub_file_off("REGION_COUNT"),
                     len(segment_info), width)
         print(f'      REGION_COUNT = {len(segment_info)}')
-        
-        # 填充每个段的信息
+
+        # 填充每个段的信息（按虚拟地址排序，与恢复顺序一致）
         for i, (seg_idx, info) in enumerate(sorted(segment_info.items())):
             if i >= STUB_MAX_REGIONS:
                 break
-            
-            # REGION_ADDRS[i]
+
+            # REGION_ADDRS[i]：段的原始虚拟地址
             patch_value(output_file, stub_file_off("REGION_ADDRS", i),
                         info['vaddr'], width)
-            
-            # REGION_SIZES[i]
+
+            # REGION_SIZES[i]：污染后的大小（compact_in_place 需要处理的缓冲区大小）
+            # 必须使用 polluted_size 而非原始 size：C 代码会验证
+            # blocks * (retain + del) <= region_size，使用原始 size 会导致该检查失败（返回 -7）
             patch_value(output_file, stub_file_off("REGION_SIZES", i),
-                        info['size'], width)
-            
-            # REGION_RETAINS[i] = block_size
+                        info['polluted_size'], width)
+
+            # REGION_RETAINS[i] = block_size（每次保留的字节数）
             patch_value(output_file, stub_file_off("REGION_RETAINS", i),
                         info['block_size'], width)
-            
-            # REGION_DELETES[i] = insert_size
+
+            # REGION_DELETES[i] = insert_size（每次删除的字节数）
             patch_value(output_file, stub_file_off("REGION_DELETES", i),
                         info['insert_size'], width)
-            
-            # REGION_BLOCKS[i]
+
+            # REGION_BLOCKS[i]：插入块的总数
             patch_value(output_file, stub_file_off("REGION_BLOCKS", i),
                         info['blocks'], width)
-        
+
         print(f'      填充了 {min(len(segment_info), STUB_MAX_REGIONS)} 个段信息')
-        
+
     except Exception as e:
         raise RuntimeError(f"[-] 打补丁失败: {e}")
 
@@ -591,11 +732,13 @@ def pack_with_convex_hull(target_file: Path,
     except Exception as e:
         print(f'[-] {e}')
         return False
-    
+
+    original_oep = binary.header.entrypoint
     print(f'     最小虚拟地址: {hex(convex_info["min_vaddr"])}')
     print(f'     最大虚拟地址: {hex(convex_info["max_vaddr"])}')
     print(f'     凸包大小: {hex(convex_info["size"])} ({convex_info["size"]} 字节)')
     print(f'     包含 PT_LOAD 段数: {convex_info["count"]}')
+    print(f'     原始入口点 (OEP): {hex(original_oep)}')
     
     # 构建凸包内容
     print('   构建污染数据...')
@@ -650,60 +793,109 @@ def pack_with_convex_hull(target_file: Path,
         print(f'[-] {e}')
         return False
     
-    # 创建凸包 ELF
+    # 创建凸包 ELF（写入临时文件）
     print('   创建凸包 ELF...')
     try:
-        new_binary = create_convex_hull_elf(
-            target_file, binary, convex_info, convex_content,
-            stub_entry_offset, stub_blob, is64
-        )
-    except Exception as e:
-        print(f'[-] {e}')
-        return False
-    
-    # 写到临时文件
-    try:
-        new_binary.write(str(temp_file))
-    except Exception as e:
-        print(f'[-] 写临时文件失败: {e}')
-        return False
-    
-    # 解析临时文件
-    try:
-        temp_bin = lief.parse(str(temp_file))
-        if not temp_bin:
-            print('[-] 无法解析临时 ELF')
-            return False
-        
         stub_symbol_offsets = get_stub_symbol_offsets(stub, stub_min_va, STUB_PATCH_SYMBOLS)
+        stub_pad, stub_offset_in_combined, convex_vaddr, content_file_offset = create_convex_hull_elf(
+            target_file, binary, convex_info, convex_content,
+            stub_entry_offset, stub_blob, is64, temp_file
+        )
+        print(f'     凸包起始虚拟地址: {hex(convex_vaddr)} (stub_pad={hex(stub_pad)}, '
+              f'stub_offset={hex(stub_offset_in_combined)})')
     except Exception as e:
         print(f'[-] {e}')
         return False
-    
-    # 打补丁
+
+    # 打补丁（从临时文件复制到输出文件，然后打补丁）
     print('   打补丁...')
     try:
         shutil.copy(str(temp_file), str(output_file))
         _patch_convex_hull_stub(
-            temp_file, output_file, temp_bin, is64, 
-            convex_info, segment_info, stub_symbol_offsets
+            output_file, is64,
+            convex_info, segment_info, stub_symbol_offsets,
+            original_oep, stub_pad, stub_offset_in_combined, content_file_offset
         )
     except Exception as e:
         print(f'[-] 打补丁失败: {e}')
         return False
-    
+
     # 保持可执行权限
     try:
         shutil.copymode(target_file, output_file)
     except Exception:
         pass
-    
+
+    # 恢复一致性验证（可选）
+    if verify_recovery:
+        _verify_recovery(file_bytes, segment_info)
+
     print(f'[+] 已生成: {output_file}')
     print(f'[+] 凸包模式：单一 PT_LOAD，覆盖 {convex_info["count"]} 个原始段')
+    print(f'[+] 凸包起始地址: {hex(convex_vaddr)}, 原始数据起始: {hex(convex_info["min_vaddr"])}')
     print(f'[+] 虚拟地址范围: {hex(convex_info["min_vaddr"])} - {hex(convex_info["max_vaddr"])}')
     print(f'[+] 共污染 {sum(info["blocks"] for info in segment_info.values())} 个块\n')
-    
+
     return True
+
+
+def _compact_in_place_py(data: bytearray, retain: int, delete: int, blocks: int) -> bytearray:
+    """
+    Python 实现的 compact_in_place，用于恢复验证。
+    与 delete.c 中的 compact_in_place 逻辑保持一致。
+    """
+    region_size = len(data)
+    result = bytearray()
+    pos = 0
+
+    for _ in range(blocks):
+        if pos >= region_size:
+            break
+        retain_len = min(retain, region_size - pos)
+        result.extend(data[pos:pos + retain_len])
+        pos += retain_len
+        del_len = min(delete, region_size - pos)
+        pos += del_len
+
+    if pos < region_size:
+        result.extend(data[pos:])
+
+    return result
+
+
+def _verify_recovery(file_bytes: bytes, segment_info: dict) -> None:
+    """
+    恢复一致性验证：对每个段的污染数据执行 Python 侧 compact_in_place，
+    比较恢复结果与原始数据是否一致。
+    """
+    print('   [验证] 恢复一致性校验...')
+    all_ok = True
+    for seg_idx, info in sorted(segment_info.items()):
+        orig_start = info.get('_orig_file_start')
+        orig_size  = info.get('size', 0)
+        poll_data  = info.get('_polluted_data')
+
+        if poll_data is None or orig_start is None:
+            # 元数据未记录，跳过
+            continue
+
+        original_data = file_bytes[orig_start:orig_start + orig_size]
+        recovered = _compact_in_place_py(
+            bytearray(poll_data),
+            info['block_size'],
+            info['insert_size'],
+            info['blocks'],
+        )
+
+        if bytes(recovered[:orig_size]) != original_data:
+            print(f'     [!] 段 {seg_idx} (vaddr={hex(info["vaddr"])}) '
+                  f'恢复结果与原始数据不一致！')
+            all_ok = False
+        else:
+            print(f'     [✓] 段 {seg_idx} (vaddr={hex(info["vaddr"])}) 恢复验证通过')
+
+    if all_ok:
+        print('   [验证] 全部段恢复验证通过 ✓')
 
 
 def _output_name(src: Path, suffix: str) -> str:
