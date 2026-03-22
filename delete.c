@@ -33,6 +33,21 @@
 #define MAGIC_REGION_BLOCKS    0xCCCCCCCC33333333ULL
 #define MAGIC_CONVEX_MIN_VADDR 0xEEEEEEEE66666666ULL
 
+/* New: ELF header recovery */
+#define MAGIC_HEADER_VADDR     0x1A1A1A1A2A2A2A2AULL
+#define MAGIC_HEADER_OFFSET    0x2B2B2B2B3B3B3B3BULL
+#define MAGIC_HEADER_SIZE      0x3C3C3C3C4C4C4C4CULL
+#define MAGIC_HEADER_RETAIN    0x4D4D4D4D5D5D5D5DULL
+#define MAGIC_HEADER_DELETE    0x5E5E5E5E6E6E6E6EULL
+#define MAGIC_HEADER_BLOCKS    0x6F6F6F6F7F7F7F7FULL
+/* New: per-region offset in convex */
+#define MAGIC_REGION_OFFSET    0xDDDDDDDD55555555ULL
+/* New: protected (non-pollutable) PT_LOAD */
+#define MAGIC_PROTECTED_COUNT  0xFFFFFFFF22222222ULL
+#define MAGIC_PROTECTED_ADDR   0xAAAAAAAA66666666ULL
+#define MAGIC_PROTECTED_SIZE   0xBBBBBBBB77777777ULL
+#define MAGIC_PROTECTED_OFFSET 0xCCCCCCCC88888888ULL
+
 typedef uint64_t uaddr_t;
 
 STUB_TEXT_SYM volatile uint64_t OEP_ADDR         = MAGIC_OEP;
@@ -44,6 +59,20 @@ STUB_TEXT_SYM volatile uint64_t REGION_SIZES[STUB_MAX_REGIONS]   = { [0 ... STUB
 STUB_TEXT_SYM volatile uint64_t REGION_RETAINS[STUB_MAX_REGIONS] = { [0 ... STUB_MAX_REGIONS - 1] = MAGIC_REGION_RETAIN };
 STUB_TEXT_SYM volatile uint64_t REGION_DELETES[STUB_MAX_REGIONS] = { [0 ... STUB_MAX_REGIONS - 1] = MAGIC_REGION_DELETE };
 STUB_TEXT_SYM volatile uint64_t REGION_BLOCKS[STUB_MAX_REGIONS]  = { [0 ... STUB_MAX_REGIONS - 1] = MAGIC_REGION_BLOCKS };
+/* New: per-region offset from CONVEX_MIN_VADDR */
+STUB_TEXT_SYM volatile uint64_t REGION_OFFSETS[STUB_MAX_REGIONS] = { [0 ... STUB_MAX_REGIONS - 1] = MAGIC_REGION_OFFSET };
+/* New: ELF header recovery info */
+STUB_TEXT_SYM volatile uint64_t HEADER_VADDR  = MAGIC_HEADER_VADDR;
+STUB_TEXT_SYM volatile uint64_t HEADER_OFFSET = MAGIC_HEADER_OFFSET;
+STUB_TEXT_SYM volatile uint64_t HEADER_SIZE   = MAGIC_HEADER_SIZE;
+STUB_TEXT_SYM volatile uint64_t HEADER_RETAIN = MAGIC_HEADER_RETAIN;
+STUB_TEXT_SYM volatile uint64_t HEADER_DELETE = MAGIC_HEADER_DELETE;
+STUB_TEXT_SYM volatile uint64_t HEADER_BLOCKS = MAGIC_HEADER_BLOCKS;
+/* New: protected PT_LOAD info */
+STUB_TEXT_SYM volatile uint64_t PROTECTED_COUNT                       = MAGIC_PROTECTED_COUNT;
+STUB_TEXT_SYM volatile uint64_t PROTECTED_ADDRS[STUB_MAX_REGIONS]   = { [0 ... STUB_MAX_REGIONS - 1] = MAGIC_PROTECTED_ADDR };
+STUB_TEXT_SYM volatile uint64_t PROTECTED_SIZES[STUB_MAX_REGIONS]   = { [0 ... STUB_MAX_REGIONS - 1] = MAGIC_PROTECTED_SIZE };
+STUB_TEXT_SYM volatile uint64_t PROTECTED_OFFSETS[STUB_MAX_REGIONS] = { [0 ... STUB_MAX_REGIONS - 1] = MAGIC_PROTECTED_OFFSET };
 #else
 #define MAGIC_OEP              0x22222222U
 #define MAGIC_VOFFSET          0x88888888U
@@ -54,6 +83,21 @@ STUB_TEXT_SYM volatile uint64_t REGION_BLOCKS[STUB_MAX_REGIONS]  = { [0 ... STUB
 #define MAGIC_REGION_DELETE    0x55555555U
 #define MAGIC_REGION_BLOCKS    0x77777777U
 #define MAGIC_CONVEX_MIN_VADDR 0xEEEE6666U
+
+/* New: ELF header recovery */
+#define MAGIC_HEADER_VADDR     0x1A2A1A2AU
+#define MAGIC_HEADER_OFFSET    0x2B3B2B3BU
+#define MAGIC_HEADER_SIZE      0x3C4C3C4CU
+#define MAGIC_HEADER_RETAIN    0x4D5D4D5DU
+#define MAGIC_HEADER_DELETE    0x5E6E5E6EU
+#define MAGIC_HEADER_BLOCKS    0x6F7F6F7FU
+/* New: per-region offset in convex */
+#define MAGIC_REGION_OFFSET    0xDDDD5555U
+/* New: protected (non-pollutable) PT_LOAD */
+#define MAGIC_PROTECTED_COUNT  0xFF222222U
+#define MAGIC_PROTECTED_ADDR   0xAA666666U
+#define MAGIC_PROTECTED_SIZE   0xBB777777U
+#define MAGIC_PROTECTED_OFFSET 0xCC888888U
 
 typedef uint32_t uaddr_t;
 
@@ -66,6 +110,20 @@ STUB_TEXT_SYM volatile uint32_t REGION_SIZES[STUB_MAX_REGIONS]   = { [0 ... STUB
 STUB_TEXT_SYM volatile uint32_t REGION_RETAINS[STUB_MAX_REGIONS] = { [0 ... STUB_MAX_REGIONS - 1] = MAGIC_REGION_RETAIN };
 STUB_TEXT_SYM volatile uint32_t REGION_DELETES[STUB_MAX_REGIONS] = { [0 ... STUB_MAX_REGIONS - 1] = MAGIC_REGION_DELETE };
 STUB_TEXT_SYM volatile uint32_t REGION_BLOCKS[STUB_MAX_REGIONS]  = { [0 ... STUB_MAX_REGIONS - 1] = MAGIC_REGION_BLOCKS };
+/* New: per-region offset from CONVEX_MIN_VADDR */
+STUB_TEXT_SYM volatile uint32_t REGION_OFFSETS[STUB_MAX_REGIONS] = { [0 ... STUB_MAX_REGIONS - 1] = MAGIC_REGION_OFFSET };
+/* New: ELF header recovery info */
+STUB_TEXT_SYM volatile uint32_t HEADER_VADDR  = MAGIC_HEADER_VADDR;
+STUB_TEXT_SYM volatile uint32_t HEADER_OFFSET = MAGIC_HEADER_OFFSET;
+STUB_TEXT_SYM volatile uint32_t HEADER_SIZE   = MAGIC_HEADER_SIZE;
+STUB_TEXT_SYM volatile uint32_t HEADER_RETAIN = MAGIC_HEADER_RETAIN;
+STUB_TEXT_SYM volatile uint32_t HEADER_DELETE = MAGIC_HEADER_DELETE;
+STUB_TEXT_SYM volatile uint32_t HEADER_BLOCKS = MAGIC_HEADER_BLOCKS;
+/* New: protected PT_LOAD info */
+STUB_TEXT_SYM volatile uint32_t PROTECTED_COUNT                       = MAGIC_PROTECTED_COUNT;
+STUB_TEXT_SYM volatile uint32_t PROTECTED_ADDRS[STUB_MAX_REGIONS]   = { [0 ... STUB_MAX_REGIONS - 1] = MAGIC_PROTECTED_ADDR };
+STUB_TEXT_SYM volatile uint32_t PROTECTED_SIZES[STUB_MAX_REGIONS]   = { [0 ... STUB_MAX_REGIONS - 1] = MAGIC_PROTECTED_SIZE };
+STUB_TEXT_SYM volatile uint32_t PROTECTED_OFFSETS[STUB_MAX_REGIONS] = { [0 ... STUB_MAX_REGIONS - 1] = MAGIC_PROTECTED_OFFSET };
 #endif
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -120,12 +178,15 @@ static uint8_t STUB_STACK[STUB_STACK_SIZE];
 #if defined(ARCH_X64)
 #define SYS_MPROTECT 10
 #define SYS_EXIT     60
+#define SYS_MMAP     9
 #elif defined(ARCH_AARCH64)
 #define SYS_MPROTECT 226
 #define SYS_EXIT     93
+#define SYS_MMAP     222
 #else
 #define SYS_MPROTECT 125
 #define SYS_EXIT     1
+#define SYS_MMAP     192   /* mmap2 */
 #endif
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -143,6 +204,17 @@ static inline long my_syscall3(long n, long a1, long a2, long a3) {
     __asm__ volatile ("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2), "d"(a3) : "rcx", "r11", "memory");
     return ret;
 }
+static inline long my_syscall6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
+    unsigned long ret;
+    register long r10 __asm__("r10") = a4;
+    register long r8  __asm__("r8")  = a5;
+    register long r9  __asm__("r9")  = a6;
+    __asm__ volatile ("syscall"
+        : "=a"(ret)
+        : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
+        : "rcx", "r11", "memory");
+    return ret;
+}
 #elif defined(ARCH_X86)
 static inline long my_syscall1(long n, long a1) {
     long ret;
@@ -152,6 +224,19 @@ static inline long my_syscall1(long n, long a1) {
 static inline long my_syscall3(long n, long a1, long a2, long a3) {
     long ret;
     __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(n), "b"(a1), "c"(a2), "d"(a3) : "memory");
+    return ret;
+}
+static inline long my_syscall6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
+    long ret;
+    register long ebp_save __asm__("ebp") = a6;
+    __asm__ volatile (
+        "push %%ebp\n\t"
+        "movl %7, %%ebp\n\t"
+        "int $0x80\n\t"
+        "pop %%ebp\n\t"
+        : "=a"(ret)
+        : "a"(n), "b"(a1), "c"(a2), "d"(a3), "S"(a4), "D"(a5), "m"(ebp_save)
+        : "memory");
     return ret;
 }
 #elif defined(ARCH_AARCH64)
@@ -167,6 +252,20 @@ static inline long my_syscall3(long n, long a1, long a2, long a3) {
     register long x2 __asm__("x2") = a3;
     register long x8 __asm__("x8") = n;
     __asm__ volatile ("svc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x8) : "memory", "cc");
+    return x0;
+}
+static inline long my_syscall6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
+    register long x0 __asm__("x0") = a1;
+    register long x1 __asm__("x1") = a2;
+    register long x2 __asm__("x2") = a3;
+    register long x3 __asm__("x3") = a4;
+    register long x4 __asm__("x4") = a5;
+    register long x5 __asm__("x5") = a6;
+    register long x8 __asm__("x8") = n;
+    __asm__ volatile ("svc #0"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8)
+        : "memory", "cc");
     return x0;
 }
 #elif defined(ARCH_ARM)
@@ -195,6 +294,24 @@ static inline long my_syscall3(long n, long a1, long a2, long a3) {
         : "=r"(ret)
         : "r"(n), "r"(a1), "r"(a2), "r"(a3)
         : "r0", "r1", "r2", "r7", "memory", "cc", "lr"
+    );
+    return ret;
+}
+static inline long my_syscall6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
+    long ret;
+    __asm__ volatile (
+        "mov r7, %1\n\t"
+        "mov r0, %2\n\t"
+        "mov r1, %3\n\t"
+        "mov r2, %4\n\t"
+        "mov r3, %5\n\t"
+        "mov r4, %6\n\t"
+        "mov r5, %7\n\t"
+        "svc 0\n\t"
+        "mov %0, r0\n\t"
+        : "=r"(ret)
+        : "r"(n), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6)
+        : "r0", "r1", "r2", "r3", "r4", "r5", "r7", "memory", "cc", "lr"
     );
     return ret;
 }
@@ -229,6 +346,39 @@ static inline void fail_exit(int code) {
     my_syscall1(SYS_EXIT, code);
     for (;;) { }
 }
+
+/*
+ * my_mmap: wrap mmap(2).
+ *   prot  = PROT_RWX = 7
+ *   flags = MAP_PRIVATE|MAP_ANONYMOUS = 0x22  (add MAP_FIXED 0x10 → 0x32)
+ */
+static inline uaddr_t my_mmap(uaddr_t addr, uaddr_t len, int prot, int flags) {
+    long ret = my_syscall6(SYS_MMAP,
+                           (long)addr, (long)len,
+                           (long)prot, (long)flags,
+                           -1L, 0L);
+    return (uaddr_t)ret;
+}
+
+/* alloc_temp: anonymous RWX page(s); exits on failure. */
+static inline uaddr_t alloc_temp(uaddr_t size) {
+    uaddr_t page_size = 0x1000;
+    uaddr_t aligned   = (size + page_size - 1) & ~(page_size - 1);
+    uaddr_t addr = my_mmap(0, aligned, 7, 0x22 /*MAP_PRIVATE|MAP_ANON*/);
+    if (addr == (uaddr_t)-1 || addr == 0) fail_exit(2);
+    return addr;
+}
+
+/* map_fixed: MAP_FIXED anonymous page(s) at target_addr; exits on failure. */
+static inline void map_fixed(uaddr_t target_addr, uaddr_t size) {
+    uaddr_t aligned_addr = target_addr & ~(uaddr_t)0xfff;
+    uaddr_t end          = (target_addr + size + 0xfff) & ~(uaddr_t)0xfff;
+    uaddr_t aligned_size = end - aligned_addr;
+    uaddr_t ret = my_mmap(aligned_addr, aligned_size,
+                          7, 0x32 /*MAP_FIXED|MAP_PRIVATE|MAP_ANON*/);
+    if (ret == (uaddr_t)-1) fail_exit(3);
+}
+
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 6. 删块恢复函数
@@ -353,50 +503,64 @@ static __attribute__((noinline)) void stub_main(void) {
     uaddr_t convex_base = CONVEX_MIN_VADDR;
     uaddr_t new_oep = OEP_ADDR;
     uaddr_t count = REGION_COUNT;
+    uaddr_t prot_count = PROTECTED_COUNT;
     uaddr_t i;
+    uaddr_t dummy;
     int rc;
 
     if (count > STUB_MAX_REGIONS) count = STUB_MAX_REGIONS;
+    if (prot_count > STUB_MAX_REGIONS) prot_count = STUB_MAX_REGIONS;
 
-    // 直接在凸包内恢复数据（所有地址都有效）
+    /* Phase 1: recover polluted (recoverable) PT_LOAD regions */
     for (i = 0; i < count; i++) {
-        uaddr_t region_vaddr = REGION_ADDRS[i];
-        uaddr_t region_size = REGION_SIZES[i];
-        uaddr_t retain = REGION_RETAINS[i];
-        uaddr_t del = REGION_DELETES[i];
-        uaddr_t blocks = REGION_BLOCKS[i];
+        uaddr_t region_vaddr  = REGION_ADDRS[i];
+        uaddr_t region_size   = REGION_SIZES[i];
+        uaddr_t retain        = REGION_RETAINS[i];
+        uaddr_t del           = REGION_DELETES[i];
+        uaddr_t blocks        = REGION_BLOCKS[i];
+        uaddr_t src           = convex_base + REGION_OFFSETS[i];
+        uaddr_t polluted_size = region_size + blocks * del;
 
         if (!region_size || !retain) continue;
 
-        // 使目标地址可写
-        my_syscall3(
-            SYS_MPROTECT,
-            (long)(region_vaddr & ~0xfffUL),
-            (long)(((region_size + 0xfff) & ~0xfffUL)),
-            7  // PROT_READ|PROT_WRITE|PROT_EXEC
-        );
-
-        // 直接原地恢复
-        uaddr_t oep_offset = (uaddr_t)-1;
-        if (new_oep >= region_vaddr && new_oep < region_vaddr + region_size) {
-            oep_offset = new_oep - region_vaddr;
-        }
-
+        uaddr_t temp = alloc_temp(region_size);
         rc = compact_in_place(
-            (uint8_t *)region_vaddr,
-            (uint8_t *)region_vaddr,
-            region_size,
-            retain,
-            del,
-            blocks,
-            oep_offset,
-            &new_oep
+            (uint8_t *)src, (uint8_t *)temp,
+            polluted_size, retain, del, blocks,
+            (uaddr_t)-1, &dummy
         );
-
         if (rc != 0) fail_exit(1);
+        map_fixed(region_vaddr, region_size);
+        memcpy_safe((uint8_t *)region_vaddr, (uint8_t *)temp, region_size);
     }
 
-    // 跳转到恢复后的 OEP
+    /* Phase 2: copy protected (non-pollutable) PT_LOAD regions */
+    for (i = 0; i < prot_count; i++) {
+        uaddr_t vaddr = PROTECTED_ADDRS[i];
+        uaddr_t size  = PROTECTED_SIZES[i];
+        uaddr_t src   = convex_base + PROTECTED_OFFSETS[i];
+
+        if (!size) continue;
+        map_fixed(vaddr, size);
+        memcpy_safe((uint8_t *)vaddr, (uint8_t *)src, size);
+    }
+
+    /* Phase 3: recover ELF header */
+    if (HEADER_SIZE && HEADER_RETAIN) {
+        uaddr_t hdr_src      = convex_base + HEADER_OFFSET;
+        uaddr_t hdr_polluted = HEADER_SIZE + HEADER_BLOCKS * HEADER_DELETE;
+        uaddr_t hdr_temp     = alloc_temp(HEADER_SIZE);
+        rc = compact_in_place(
+            (uint8_t *)hdr_src, (uint8_t *)hdr_temp,
+            hdr_polluted, HEADER_RETAIN, HEADER_DELETE, HEADER_BLOCKS,
+            (uaddr_t)-1, &dummy
+        );
+        if (rc != 0) fail_exit(1);
+        map_fixed(HEADER_VADDR, HEADER_SIZE);
+        memcpy_safe((uint8_t *)HEADER_VADDR, (uint8_t *)hdr_temp, HEADER_SIZE);
+    }
+
+    /* Phase 4: jump to OEP */
     __asm__ volatile (
         "mov %0, %%rdx\n\t"
         "mov %1, %%rsp\n\t"
@@ -439,58 +603,89 @@ static inline uint8_t *get_stub_base(void) {
 }
 
 static __attribute__((noinline)) void stub_main(uint8_t *stub_base) {
-    volatile uint32_t *oep_ptr      = (volatile uint32_t*)(stub_base + OFF(OEP_ADDR));
-    volatile uint32_t *region_count_p = (volatile uint32_t*)(stub_base + OFF(REGION_COUNT));
-    volatile uint32_t *region_addrs_p = (volatile uint32_t*)(stub_base + OFF(REGION_ADDRS));
-    volatile uint32_t *region_sizes_p = (volatile uint32_t*)(stub_base + OFF(REGION_SIZES));
+    volatile uint32_t *oep_ptr         = (volatile uint32_t*)(stub_base + OFF(OEP_ADDR));
+    volatile uint32_t *region_count_p  = (volatile uint32_t*)(stub_base + OFF(REGION_COUNT));
+    volatile uint32_t *region_addrs_p  = (volatile uint32_t*)(stub_base + OFF(REGION_ADDRS));
+    volatile uint32_t *region_sizes_p  = (volatile uint32_t*)(stub_base + OFF(REGION_SIZES));
     volatile uint32_t *region_retain_p = (volatile uint32_t*)(stub_base + OFF(REGION_RETAINS));
     volatile uint32_t *region_delete_p = (volatile uint32_t*)(stub_base + OFF(REGION_DELETES));
     volatile uint32_t *region_blocks_p = (volatile uint32_t*)(stub_base + OFF(REGION_BLOCKS));
-    volatile uint32_t *saved_esp_p  = (volatile uint32_t*)(stub_base + OFF(SAVED_ESP));
-    volatile uint32_t *saved_edx_p  = (volatile uint32_t*)(stub_base + OFF(SAVED_EDX));
+    volatile uint32_t *saved_esp_p     = (volatile uint32_t*)(stub_base + OFF(SAVED_ESP));
+    volatile uint32_t *saved_edx_p     = (volatile uint32_t*)(stub_base + OFF(SAVED_EDX));
+    volatile uint32_t *convex_base_p   = (volatile uint32_t*)(stub_base + OFF(CONVEX_MIN_VADDR));
+    volatile uint32_t *region_offs_p   = (volatile uint32_t*)(stub_base + OFF(REGION_OFFSETS));
+    volatile uint32_t *prot_count_p    = (volatile uint32_t*)(stub_base + OFF(PROTECTED_COUNT));
+    volatile uint32_t *prot_addrs_p    = (volatile uint32_t*)(stub_base + OFF(PROTECTED_ADDRS));
+    volatile uint32_t *prot_sizes_p    = (volatile uint32_t*)(stub_base + OFF(PROTECTED_SIZES));
+    volatile uint32_t *prot_offs_p     = (volatile uint32_t*)(stub_base + OFF(PROTECTED_OFFSETS));
+    volatile uint32_t *hdr_vaddr_p     = (volatile uint32_t*)(stub_base + OFF(HEADER_VADDR));
+    volatile uint32_t *hdr_off_p       = (volatile uint32_t*)(stub_base + OFF(HEADER_OFFSET));
+    volatile uint32_t *hdr_size_p      = (volatile uint32_t*)(stub_base + OFF(HEADER_SIZE));
+    volatile uint32_t *hdr_retain_p    = (volatile uint32_t*)(stub_base + OFF(HEADER_RETAIN));
+    volatile uint32_t *hdr_del_p       = (volatile uint32_t*)(stub_base + OFF(HEADER_DELETE));
+    volatile uint32_t *hdr_blocks_p    = (volatile uint32_t*)(stub_base + OFF(HEADER_BLOCKS));
 
-    uint32_t new_oep = *oep_ptr;
-    uint32_t count = *region_count_p;
+    uint32_t new_oep    = *oep_ptr;
+    uint32_t convex_base = *convex_base_p;
+    uint32_t count      = *region_count_p;
+    uint32_t prot_count = *prot_count_p;
     uint32_t i;
+    uint32_t dummy;
     int rc;
 
     if (count > STUB_MAX_REGIONS) count = STUB_MAX_REGIONS;
+    if (prot_count > STUB_MAX_REGIONS) prot_count = STUB_MAX_REGIONS;
 
+    /* Phase 1: recover polluted PT_LOAD regions */
     for (i = 0; i < count; i++) {
-        uint32_t region_vaddr = region_addrs_p[i];
-        uint32_t region_size = region_sizes_p[i];
-        uint32_t retain = region_retain_p[i];
-        uint32_t del = region_delete_p[i];
-        uint32_t blocks = region_blocks_p[i];
+        uint32_t region_vaddr  = region_addrs_p[i];
+        uint32_t region_size   = region_sizes_p[i];
+        uint32_t retain        = region_retain_p[i];
+        uint32_t del           = region_delete_p[i];
+        uint32_t blocks        = region_blocks_p[i];
+        uint32_t src           = convex_base + region_offs_p[i];
+        uint32_t polluted_size = region_size + blocks * del;
 
         if (!region_size || !retain) continue;
 
-        my_syscall3(
-            SYS_MPROTECT,
-            (long)(region_vaddr & ~0xfffL),
-            (long)(((region_size + 0xfff) & ~0xfffL)),
-            7
-        );
-
-        uint32_t oep_offset = (uint32_t)-1;
-        if (new_oep >= region_vaddr && new_oep < region_vaddr + region_size) {
-            oep_offset = new_oep - region_vaddr;
-        }
-
+        uint32_t temp = (uint32_t)alloc_temp(region_size);
         rc = compact_in_place(
-            (uint8_t *)region_vaddr,
-            (uint8_t *)region_vaddr,
-            region_size,
-            retain,
-            del,
-            blocks,
-            oep_offset,
-            (uaddr_t *)&new_oep
+            (uint8_t *)src, (uint8_t *)temp,
+            polluted_size, retain, del, blocks,
+            (uaddr_t)-1, (uaddr_t *)&dummy
         );
-
         if (rc != 0) fail_exit(1);
+        map_fixed(region_vaddr, region_size);
+        memcpy_safe((uint8_t *)region_vaddr, (uint8_t *)temp, region_size);
     }
 
+    /* Phase 2: copy protected PT_LOAD regions */
+    for (i = 0; i < prot_count; i++) {
+        uint32_t vaddr = prot_addrs_p[i];
+        uint32_t size  = prot_sizes_p[i];
+        uint32_t src   = convex_base + prot_offs_p[i];
+
+        if (!size) continue;
+        map_fixed(vaddr, size);
+        memcpy_safe((uint8_t *)vaddr, (uint8_t *)src, size);
+    }
+
+    /* Phase 3: recover ELF header */
+    if (*hdr_size_p && *hdr_retain_p) {
+        uint32_t hdr_src      = convex_base + *hdr_off_p;
+        uint32_t hdr_polluted = *hdr_size_p + *hdr_blocks_p * *hdr_del_p;
+        uint32_t hdr_temp     = (uint32_t)alloc_temp(*hdr_size_p);
+        rc = compact_in_place(
+            (uint8_t *)hdr_src, (uint8_t *)hdr_temp,
+            hdr_polluted, *hdr_retain_p, *hdr_del_p, *hdr_blocks_p,
+            (uaddr_t)-1, (uaddr_t *)&dummy
+        );
+        if (rc != 0) fail_exit(1);
+        map_fixed(*hdr_vaddr_p, *hdr_size_p);
+        memcpy_safe((uint8_t *)*hdr_vaddr_p, (uint8_t *)hdr_temp, *hdr_size_p);
+    }
+
+    /* Phase 4: jump to OEP */
     __asm__ volatile (
         "movl %0, %%edx\n\t"
         "movl %1, %%esp\n\t"
@@ -526,48 +721,67 @@ void _start(void) {
 #elif defined(ARCH_AARCH64)
 
 static __attribute__((noinline)) void stub_main(void) {
-    uaddr_t new_oep = OEP_ADDR;
-    uaddr_t count = REGION_COUNT;
+    uaddr_t convex_base = CONVEX_MIN_VADDR;
+    uaddr_t new_oep    = OEP_ADDR;
+    uaddr_t count      = REGION_COUNT;
+    uaddr_t prot_count = PROTECTED_COUNT;
     uaddr_t i;
+    uaddr_t dummy;
     int rc;
 
     if (count > STUB_MAX_REGIONS) count = STUB_MAX_REGIONS;
+    if (prot_count > STUB_MAX_REGIONS) prot_count = STUB_MAX_REGIONS;
 
+    /* Phase 1: recover polluted PT_LOAD regions */
     for (i = 0; i < count; i++) {
-        uaddr_t region_vaddr = REGION_ADDRS[i];
-        uaddr_t region_size = REGION_SIZES[i];
-        uaddr_t retain = REGION_RETAINS[i];
-        uaddr_t del = REGION_DELETES[i];
-        uaddr_t blocks = REGION_BLOCKS[i];
+        uaddr_t region_vaddr  = REGION_ADDRS[i];
+        uaddr_t region_size   = REGION_SIZES[i];
+        uaddr_t retain        = REGION_RETAINS[i];
+        uaddr_t del           = REGION_DELETES[i];
+        uaddr_t blocks        = REGION_BLOCKS[i];
+        uaddr_t src           = convex_base + REGION_OFFSETS[i];
+        uaddr_t polluted_size = region_size + blocks * del;
 
         if (!region_size || !retain) continue;
 
-        my_syscall3(
-            SYS_MPROTECT,
-            (long)(region_vaddr & ~0xfffL),
-            (long)(((region_size + 0xfff) & ~0xfffL)),
-            7
-        );
-
-        uaddr_t oep_offset = (uaddr_t)-1;
-        if (new_oep >= region_vaddr && new_oep < region_vaddr + region_size) {
-            oep_offset = new_oep - region_vaddr;
-        }
-
+        uaddr_t temp = alloc_temp(region_size);
         rc = compact_in_place(
-            (uint8_t *)region_vaddr,
-            (uint8_t *)region_vaddr,
-            region_size,
-            retain,
-            del,
-            blocks,
-            oep_offset,
-            &new_oep
+            (uint8_t *)src, (uint8_t *)temp,
+            polluted_size, retain, del, blocks,
+            (uaddr_t)-1, &dummy
         );
-
         if (rc != 0) fail_exit(1);
+        map_fixed(region_vaddr, region_size);
+        memcpy_safe((uint8_t *)region_vaddr, (uint8_t *)temp, region_size);
     }
 
+    /* Phase 2: copy protected PT_LOAD regions */
+    for (i = 0; i < prot_count; i++) {
+        uaddr_t vaddr = PROTECTED_ADDRS[i];
+        uaddr_t size  = PROTECTED_SIZES[i];
+        uaddr_t src   = convex_base + PROTECTED_OFFSETS[i];
+
+        if (!size) continue;
+        map_fixed(vaddr, size);
+        memcpy_safe((uint8_t *)vaddr, (uint8_t *)src, size);
+    }
+
+    /* Phase 3: recover ELF header */
+    if (HEADER_SIZE && HEADER_RETAIN) {
+        uaddr_t hdr_src      = convex_base + HEADER_OFFSET;
+        uaddr_t hdr_polluted = HEADER_SIZE + HEADER_BLOCKS * HEADER_DELETE;
+        uaddr_t hdr_temp     = alloc_temp(HEADER_SIZE);
+        rc = compact_in_place(
+            (uint8_t *)hdr_src, (uint8_t *)hdr_temp,
+            hdr_polluted, HEADER_RETAIN, HEADER_DELETE, HEADER_BLOCKS,
+            (uaddr_t)-1, &dummy
+        );
+        if (rc != 0) fail_exit(1);
+        map_fixed(HEADER_VADDR, HEADER_SIZE);
+        memcpy_safe((uint8_t *)HEADER_VADDR, (uint8_t *)hdr_temp, HEADER_SIZE);
+    }
+
+    /* Phase 4: jump to OEP */
     __asm__ volatile (
         "mov x0, %0\n\t"
         "mov x1, %1\n\t"
@@ -615,48 +829,67 @@ __attribute__((naked)) void _start(void) {
 #elif defined(ARCH_ARM)
 
 static __attribute__((noinline)) void stub_main(void) {
-    uaddr_t new_oep = OEP_ADDR;
-    uaddr_t count = REGION_COUNT;
+    uaddr_t convex_base = CONVEX_MIN_VADDR;
+    uaddr_t new_oep    = OEP_ADDR;
+    uaddr_t count      = REGION_COUNT;
+    uaddr_t prot_count = PROTECTED_COUNT;
     uaddr_t i;
+    uaddr_t dummy;
     int rc;
 
     if (count > STUB_MAX_REGIONS) count = STUB_MAX_REGIONS;
+    if (prot_count > STUB_MAX_REGIONS) prot_count = STUB_MAX_REGIONS;
 
+    /* Phase 1: recover polluted PT_LOAD regions */
     for (i = 0; i < count; i++) {
-        uaddr_t region_vaddr = REGION_ADDRS[i];
-        uaddr_t region_size = REGION_SIZES[i];
-        uaddr_t retain = REGION_RETAINS[i];
-        uaddr_t del = REGION_DELETES[i];
-        uaddr_t blocks = REGION_BLOCKS[i];
+        uaddr_t region_vaddr  = REGION_ADDRS[i];
+        uaddr_t region_size   = REGION_SIZES[i];
+        uaddr_t retain        = REGION_RETAINS[i];
+        uaddr_t del           = REGION_DELETES[i];
+        uaddr_t blocks        = REGION_BLOCKS[i];
+        uaddr_t src           = convex_base + REGION_OFFSETS[i];
+        uaddr_t polluted_size = region_size + blocks * del;
 
         if (!region_size || !retain) continue;
 
-        my_syscall3(
-            SYS_MPROTECT,
-            (long)(region_vaddr & ~0xfffL),
-            (long)(((region_size + 0xfff) & ~0xfffL)),
-            7
-        );
-
-        uaddr_t oep_offset = (uaddr_t)-1;
-        if (new_oep >= region_vaddr && new_oep < region_vaddr + region_size) {
-            oep_offset = new_oep - region_vaddr;
-        }
-
+        uaddr_t temp = alloc_temp(region_size);
         rc = compact_in_place(
-            (uint8_t *)region_vaddr,
-            (uint8_t *)region_vaddr,
-            region_size,
-            retain,
-            del,
-            blocks,
-            oep_offset,
-            (uaddr_t *)&new_oep
+            (uint8_t *)src, (uint8_t *)temp,
+            polluted_size, retain, del, blocks,
+            (uaddr_t)-1, (uaddr_t *)&dummy
         );
-
         if (rc != 0) fail_exit(1);
+        map_fixed(region_vaddr, region_size);
+        memcpy_safe((uint8_t *)region_vaddr, (uint8_t *)temp, region_size);
     }
 
+    /* Phase 2: copy protected PT_LOAD regions */
+    for (i = 0; i < prot_count; i++) {
+        uaddr_t vaddr = PROTECTED_ADDRS[i];
+        uaddr_t size  = PROTECTED_SIZES[i];
+        uaddr_t src   = convex_base + PROTECTED_OFFSETS[i];
+
+        if (!size) continue;
+        map_fixed(vaddr, size);
+        memcpy_safe((uint8_t *)vaddr, (uint8_t *)src, size);
+    }
+
+    /* Phase 3: recover ELF header */
+    if (HEADER_SIZE && HEADER_RETAIN) {
+        uaddr_t hdr_src      = convex_base + HEADER_OFFSET;
+        uaddr_t hdr_polluted = HEADER_SIZE + HEADER_BLOCKS * HEADER_DELETE;
+        uaddr_t hdr_temp     = alloc_temp(HEADER_SIZE);
+        rc = compact_in_place(
+            (uint8_t *)hdr_src, (uint8_t *)hdr_temp,
+            hdr_polluted, HEADER_RETAIN, HEADER_DELETE, HEADER_BLOCKS,
+            (uaddr_t)-1, (uaddr_t *)&dummy
+        );
+        if (rc != 0) fail_exit(1);
+        map_fixed(HEADER_VADDR, HEADER_SIZE);
+        memcpy_safe((uint8_t *)HEADER_VADDR, (uint8_t *)hdr_temp, HEADER_SIZE);
+    }
+
+    /* Phase 4: jump to OEP */
     __asm__ volatile (
         "mov r0, %0\n\t"
         "mov r1, %1\n\t"
