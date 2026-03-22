@@ -341,6 +341,94 @@ def read_back_value(file_path: Path, offset: int, width: int) -> int:
     raise ValueError('Unsupported patch width')
 
 
+def _elf_phdr_layout(file_path: Path, is64: bool) -> tuple[str, int, int, int]:
+    """Read ELF header fields needed to walk program headers."""
+    with open(file_path, 'rb') as f:
+        ident = f.read(16)
+        if len(ident) < 16 or ident[:4] != b'\x7fELF':
+            raise RuntimeError(f'[-] 非 ELF 文件: {file_path}')
+        ei_data = ident[5]
+        if ei_data == 1:
+            endian = '<'
+        elif ei_data == 2:
+            endian = '>'
+        else:
+            raise RuntimeError('[-] 不支持的 ELF 字节序')
+
+        if is64:
+            f.seek(0x20)  # e_phoff
+            e_phoff = struct.unpack(endian + 'Q', f.read(8))[0]
+            f.seek(0x36)  # e_phentsize
+            e_phentsize = struct.unpack(endian + 'H', f.read(2))[0]
+            e_phnum = struct.unpack(endian + 'H', f.read(2))[0]
+        else:
+            f.seek(0x1C)  # e_phoff
+            e_phoff = struct.unpack(endian + 'I', f.read(4))[0]
+            f.seek(0x2A)  # e_phentsize
+            e_phentsize = struct.unpack(endian + 'H', f.read(2))[0]
+            e_phnum = struct.unpack(endian + 'H', f.read(2))[0]
+
+    return endian, int(e_phoff), int(e_phentsize), int(e_phnum)
+
+
+def _nullify_recoverable_ptloads(
+        output_file: Path,
+        is64: bool,
+        recoverable_infos: list[dict],
+        vaddr_shift: int,
+) -> int:
+    """
+    Rewrite output ELF program headers: convert recoverable PT_LOAD to PT_NULL.
+
+    This keeps immutable PT_LOAD segments mapped by loader, while recoverable
+    regions are restored by stub at runtime (UPX-like behavior).
+    """
+    if not recoverable_infos:
+        return 0
+
+    targets = {
+        (int(r['vaddr']) + int(vaddr_shift), int(r['size']))
+        for r in recoverable_infos
+    }
+
+    endian, e_phoff, e_phentsize, e_phnum = _elf_phdr_layout(output_file, is64)
+    removed = 0
+
+    with open(output_file, 'r+b') as f:
+        for i in range(e_phnum):
+            ph_off = e_phoff + i * e_phentsize
+            f.seek(ph_off)
+            ph = f.read(e_phentsize)
+            if len(ph) < e_phentsize:
+                raise RuntimeError('[-] Program Header 读取失败')
+
+            p_type = struct.unpack_from(endian + 'I', ph, 0)[0]
+            if p_type != 1:  # PT_LOAD
+                continue
+
+            if is64:
+                p_vaddr = struct.unpack_from(endian + 'Q', ph, 16)[0]
+                p_filesz = struct.unpack_from(endian + 'Q', ph, 32)[0]
+                p_memsz = struct.unpack_from(endian + 'Q', ph, 40)[0]
+            else:
+                p_vaddr = struct.unpack_from(endian + 'I', ph, 8)[0]
+                p_filesz = struct.unpack_from(endian + 'I', ph, 16)[0]
+                p_memsz = struct.unpack_from(endian + 'I', ph, 20)[0]
+
+            for tvaddr, tsize in targets:
+                if int(p_vaddr) != int(tvaddr):
+                    continue
+                if int(p_filesz) < int(tsize) or int(p_memsz) < int(tsize):
+                    continue
+                # p_type -> PT_NULL
+                f.seek(ph_off)
+                f.write(struct.pack(endian + 'I', 0))
+                removed += 1
+                break
+
+    return removed
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 凸包相关函数
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -391,7 +479,11 @@ def _elf_flags(binary) -> int:
 
 # Protected section names that indicate dynamic linking
 _PROTECTED_SECTION_NAMES = frozenset({
-    '.dynamic', '.got', '.got.plt', '.plt.got', '.dynsym', '.dynstr', '.plt',
+    '.dynamic', '.got', '.got.plt',
+    '.dynsym', '.dynstr',
+    '.gnu.hash', '.gnu.version', '.gnu.version_r',
+    '.rela.dyn', '.rela.plt',
+    '.interp',
 })
 
 
@@ -588,36 +680,44 @@ def build_convex_hull_content(
 
 
 def create_convex_hull_elf(
-        _source_path: Path,
+        source_path: Path,
         binary: lief.ELF.Binary,
         convex_info: dict,
         convex_content: bytes,
         stub_entry_offset: int,
         stub_blob: bytes,
         is64: bool,
-) -> tuple[bytes, int]:
+) -> tuple[lief.ELF.Binary, int, int, int]:
     """
-    Build the packed ELF binary from scratch (bypasses LIEF for output).
-
-    The convex PT_LOAD is placed above all original segments so the stub's
-    mmap(MAP_FIXED) calls don't overwrite the running stub code.
+    Preserve the original ELF program-header layout (incl. PT_INTERP/PT_DYNAMIC)
+    and add one extra convex PT_LOAD that stores:
+        [stub_blob][convex_content]
 
     Returns:
-        (elf_bytes, convex_va)
+        (new_binary, convex_va, entry_vaddr, relocated_original_oep)
     """
+    # Re-parse to get a writable copy
+    new_binary = lief.parse(str(source_path))
+    if not new_binary:
+        raise RuntimeError(f"[-] 无法重新解析 ELF: {source_path}")
+
     combined = stub_blob + convex_content
-    convex_va   = align_up(convex_info['max_vaddr'], 0x1000)
+
+    # Add convex storage segment; keep original PT_LOAD/PT_DYNAMIC/PT_INTERP intact.
+    seg = lief.ELF.Segment()
+    seg.type = lief.ELF.Segment.TYPE.LOAD
+    seg.flags = lief.ELF.Segment.FLAGS.R | lief.ELF.Segment.FLAGS.W | lief.ELF.Segment.FLAGS.X
+    seg.alignment = 0x1000
+    seg.content = combined
+
+    added = new_binary.add(seg)
+    convex_va = int(added.virtual_address)
+    # LIEF may relocate existing segments/entrypoint after adding a segment.
+    # Capture the post-layout original OEP before switching entry to stub.
+    relocated_original_oep = int(new_binary.header.entrypoint)
     entry_vaddr = convex_va + stub_entry_offset
-
-    e_machine = _elf_machine_value(binary)
-    e_flags   = _elf_flags(binary)
-
-    if is64:
-        elf_bytes = _build_elf64(entry_vaddr, convex_va, combined, e_machine, e_flags)
-    else:
-        elf_bytes = _build_elf32(entry_vaddr, convex_va, combined, e_machine, e_flags)
-
-    return elf_bytes, convex_va
+    new_binary.header.entrypoint = entry_vaddr
+    return new_binary, convex_va, entry_vaddr, relocated_original_oep
 
 
 def _patch_convex_hull_stub(
@@ -626,7 +726,10 @@ def _patch_convex_hull_stub(
         _temp_bin,
         is64: bool,
         convex_info: dict,
+        convex_va: int,
+        stub_file_start: int,
         original_oep: int,
+        vaddr_shift: int,
         header_info: dict,
         recoverable_infos: list[dict],
         protected_infos: list[dict],
@@ -635,9 +738,6 @@ def _patch_convex_hull_stub(
 ):
     """Patch all stub variables directly into the packed ELF on disk."""
     width = 8 if is64 else 4
-
-    # stub content begins at _ELF_HEADER_OFFSET inside the file
-    stub_file_start = _ELF_HEADER_OFFSET
 
     def stub_file_off(symbol: str, idx: int | None = None) -> int:
         if symbol not in stub_symbol_offsets:
@@ -653,26 +753,27 @@ def _patch_convex_hull_stub(
 
     print('    打补丁...')
 
-    convex_va = align_up(convex_info['max_vaddr'], 0x1000)
-
     # CONVEX_MIN_VADDR (= convex_va)
     patch_value(output_file, stub_file_off('CONVEX_MIN_VADDR'), convex_va, width)
     print(f'      CONVEX_MIN_VADDR = {hex(convex_va)}')
 
+    # STUB_VOFFSET (symbol VA, not runtime VA)
+    voffset_va = convex_va + int(stub_symbol_offsets['STUB_VOFFSET'])
+    patch_value(output_file, stub_file_off('STUB_VOFFSET'), voffset_va, width)
+
     # OEP_ADDR
     patch_value(output_file, stub_file_off('OEP_ADDR'), original_oep, width)
     print(f'      OEP_ADDR = {hex(original_oep)}')
+    print(f'      VADDR_SHIFT = {hex(vaddr_shift)}')
 
-    # ── ELF Header recovery info ──────────────────────────────────────
-    h = header_info
-    patch_value(output_file, stub_file_off('HEADER_VADDR'),  h['vaddr'],  width)
-    patch_value(output_file, stub_file_off('HEADER_OFFSET'),
-                content_va_off(h['offset_in_content']), width)
-    patch_value(output_file, stub_file_off('HEADER_SIZE'),   h['size'],   width)
-    patch_value(output_file, stub_file_off('HEADER_RETAIN'), h['block_size'], width)
-    patch_value(output_file, stub_file_off('HEADER_DELETE'), h['insert_size'], width)
-    patch_value(output_file, stub_file_off('HEADER_BLOCKS'), h['blocks'], width)
-    print(f'      HEADER_VADDR={hex(h["vaddr"])} HEADER_SIZE={h["size"]} HEADER_BLOCKS={h["blocks"]}')
+    # Keep original headers for dynamic loader; disable runtime header remap.
+    patch_value(output_file, stub_file_off('HEADER_VADDR'), 0, width)
+    patch_value(output_file, stub_file_off('HEADER_OFFSET'), 0, width)
+    patch_value(output_file, stub_file_off('HEADER_SIZE'), 0, width)
+    patch_value(output_file, stub_file_off('HEADER_RETAIN'), 0, width)
+    patch_value(output_file, stub_file_off('HEADER_DELETE'), 0, width)
+    patch_value(output_file, stub_file_off('HEADER_BLOCKS'), 0, width)
+    print('      HEADER_* disabled (preserve original ELF header/PT_DYNAMIC layout)')
 
     # ── Recoverable PT_LOAD regions ───────────────────────────────────
     n_rec = min(len(recoverable_infos), STUB_MAX_REGIONS)
@@ -680,7 +781,7 @@ def _patch_convex_hull_stub(
     print(f'      REGION_COUNT = {n_rec}')
 
     for i, r in enumerate(recoverable_infos[:STUB_MAX_REGIONS]):
-        patch_value(output_file, stub_file_off('REGION_ADDRS',   i), r['vaddr'],  width)
+        patch_value(output_file, stub_file_off('REGION_ADDRS',   i), r['vaddr'] + vaddr_shift,  width)
         patch_value(output_file, stub_file_off('REGION_SIZES',   i), r['size'],   width)
         patch_value(output_file, stub_file_off('REGION_RETAINS', i), r['block_size'], width)
         patch_value(output_file, stub_file_off('REGION_DELETES', i), r['insert_size'], width)
@@ -689,15 +790,15 @@ def _patch_convex_hull_stub(
                     content_va_off(r['offset_in_content']), width)
 
     # ── Protected (non-pollutable) PT_LOAD regions ───────────────────
-    n_prot = min(len(protected_infos), STUB_MAX_REGIONS)
+    # Do not overwrite loader-relocated data (.got/.dynamic etc.) at runtime.
+    n_prot = 0
     patch_value(output_file, stub_file_off('PROTECTED_COUNT'), n_prot, width)
     print(f'      PROTECTED_COUNT = {n_prot}')
 
-    for i, p in enumerate(protected_infos[:STUB_MAX_REGIONS]):
-        patch_value(output_file, stub_file_off('PROTECTED_ADDRS',   i), p['vaddr'], width)
-        patch_value(output_file, stub_file_off('PROTECTED_SIZES',   i), p['size'],  width)
-        patch_value(output_file, stub_file_off('PROTECTED_OFFSETS', i),
-                    content_va_off(p['offset_in_content']), width)
+    for i in range(STUB_MAX_REGIONS):
+        patch_value(output_file, stub_file_off('PROTECTED_ADDRS', i), 0, width)
+        patch_value(output_file, stub_file_off('PROTECTED_SIZES', i), 0, width)
+        patch_value(output_file, stub_file_off('PROTECTED_OFFSETS', i), 0, width)
 
     print(f'      填充了 {n_rec} 个可污染段，{n_prot} 个受保护段')
 
@@ -770,10 +871,9 @@ def pack_with_convex_hull(target_file: Path,
     print(f'     凸包内容大小: {len(convex_content)} 字节')
     print(f'     可污染段数: {len(recoverable_infos)}, 受保护段数: {len(protected_infos)}')
 
-    # 记录原始 OEP
-    original_oep = int(binary.header.entrypoint)
+    # 记录原始 OEP（用于计算布局重排偏移）
+    original_oep_before_layout = int(binary.header.entrypoint)
 
-    
     # 构建 Stub
     print('   准备 Stub...')
     base_dir = Path(__file__).parent
@@ -817,21 +917,62 @@ def pack_with_convex_hull(target_file: Path,
     # 创建凸包 ELF
     print('   创建凸包 ELF...')
     try:
-        elf_bytes, convex_va = create_convex_hull_elf(
+        new_binary, convex_va, entry_vaddr, relocated_oep = create_convex_hull_elf(
             target_file, binary, convex_info, convex_content,
             stub_entry_offset, stub_blob, is64
         )
+        vaddr_shift = int(relocated_oep) - int(original_oep_before_layout)
+        print(f'     原始 OEP（重排后）: {hex(relocated_oep)}')
+        print(f'     布局虚拟地址偏移: {hex(vaddr_shift)}')
         stub_symbol_offsets = get_stub_symbol_offsets(stub, stub_min_va, STUB_PATCH_SYMBOLS)
     except Exception as e:
         print(f'[-] {e}')
         return False
 
-    # 写到输出文件
+    # 写到输出文件（保留原始 PT_DYNAMIC/PT_INTERP 等）
     try:
-        with open(output_file, 'wb') as f:
-            f.write(elf_bytes)
+        new_binary.write(str(output_file))
     except Exception as e:
         print(f'[-] 写输出文件失败: {e}')
+        return False
+
+    # 头部重建语义：
+    # - 保留不可改 PT_LOAD
+    # - 将可恢复 PT_LOAD 失活（PT_NULL）
+    # - 运行时由 stub 从 convex 段恢复并 map 回目标虚拟地址
+    try:
+        nulled = _nullify_recoverable_ptloads(
+            output_file=output_file,
+            is64=is64,
+            recoverable_infos=recoverable_infos,
+            vaddr_shift=vaddr_shift,
+        )
+        print(f'   Program Header 重写: PT_NULL 化可恢复 PT_LOAD = {nulled}')
+    except Exception as e:
+        print(f'[-] 重写 Program Header 失败: {e}')
+        return False
+
+    # 重新解析，定位新增 stub 段的文件偏移
+    try:
+        out_bin = lief.parse(str(output_file))
+        if not out_bin:
+            print('[-] 无法解析输出 ELF')
+            return False
+
+        stub_seg = None
+        for seg in out_bin.segments:
+            if seg.type != lief.ELF.Segment.TYPE.LOAD:
+                continue
+            if int(seg.virtual_address) <= int(entry_vaddr) < int(seg.virtual_address + seg.physical_size):
+                stub_seg = seg
+                break
+        if stub_seg is None:
+            print('[-] 无法在输出 ELF 中定位 stub 段')
+            return False
+        stub_file_start = int(stub_seg.file_offset)
+        convex_va = int(stub_seg.virtual_address)
+    except Exception as e:
+        print(f'[-] 解析输出布局失败: {e}')
         return False
     
     # 打补丁
@@ -839,7 +980,7 @@ def pack_with_convex_hull(target_file: Path,
     try:
         _patch_convex_hull_stub(
             temp_file, output_file, None, is64,
-            convex_info, original_oep,
+            convex_info, convex_va, stub_file_start, relocated_oep, vaddr_shift,
             header_info, recoverable_infos, protected_infos,
             len(stub_blob), stub_symbol_offsets
         )
@@ -856,7 +997,7 @@ def pack_with_convex_hull(target_file: Path,
     total_blocks = (header_info['blocks'] +
                     sum(r['blocks'] for r in recoverable_infos))
     print(f'[+] 已生成: {output_file}')
-    print(f'[+] 凸包模式：stub@{hex(align_up(convex_info["max_vaddr"], 0x1000))}，'
+    print(f'[+] 凸包模式：stub@{hex(convex_va)}，'
           f'覆盖 {convex_info["count"]} 个原始段')
     print(f'[+] 原始虚拟地址范围: {hex(convex_info["min_vaddr"])} - {hex(convex_info["max_vaddr"])}')
     print(f'[+] 共污染 {total_blocks} 个块，受保护段 {len(protected_infos)} 个\n')

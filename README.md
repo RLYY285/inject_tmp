@@ -1,19 +1,98 @@
-# README for Convex Hull Packing Mode
+# inject_tmp 使用说明（凸包模式 / UPX 风格）
 
-Welcome to the Convex Hull Packing Mode documentation. This mode enables efficient storage and retrieval of data using a novel approach that leverages automatic recovery at runtime via stub execution.
+本文档对应 `modify_tools/inject_tmp/packer.py` 的当前实现。
 
-## Overview
-The Convex Hull Packing mode optimizes data handling by ensuring that all necessary data is packed in a way that minimizes redundancy and maximizes access speed. Unlike traditional methods that require unpacking tools, our approach enables seamless recovery during execution.
+## 1. 功能概览
 
-## Key Features
-- **Automatic Data Recovery**: Data recovery occurs dynamically at runtime without the need for a separate unpacking tool. This ensures faster access and reduces overhead associated with managing additional tools.
-- **Efficient Storage**: Designed to conserve space while maintaining fast access speeds, making it ideal for environments where resources are limited.
+`inject_tmp` 采用“凸包段 + 运行时恢复”方案：
 
-## How It Works
-Once deployed, the runtime environment will execute stubs that trigger data recovery automatically. This mechanism allows for smooth operation and optimization of system resources.
+1. 保留动态链接初始化所需信息（`PT_INTERP` / `PT_DYNAMIC` 相关）。
+2. 新增一个 `PT_LOAD(RWX)` 作为 stub+数据凸包段。
+3. 将可恢复的原始 `PT_LOAD` 在程序头中改为 `PT_NULL`（首次加载不映射）。
+4. 运行时由 stub 从凸包段读取污染数据，在临时区恢复后 `MAP_FIXED` 回目标虚拟地址，再跳回 OEP。
 
-## Usage
-To utilize the Convex Hull Packing Mode, simply integrate the provided stubs into your application. The data will be automatically managed without any need for manual intervention, letting developers focus on core functionality rather than data retrieval mechanics.
+这套逻辑不再依赖“扩展段不能跨下一个 `PT_LOAD` 虚拟地址”的旧限制。
 
-## Conclusion
-In summary, the Convex Hull Packing mode revolutionizes data handling by automating the recovery process and eliminating the need for manual unpacking. Enjoy the benefits of more efficient data management and streamlined application performance!
+## 2. 当前处理流程
+
+对每个输入 ELF：
+
+1. 解析 ELF，收集全部 `PT_LOAD`，计算虚拟地址凸包范围。
+2. 将段分为两类：
+   - 可恢复段：执行“按块插入污染”（保留块 + 插入块）。
+   - 保护段：动态链接关键元数据相关段（`.dynamic/.got/.dyn*/.rela*` 等），不污染。
+3. 生成 `convex_content`（存放污染副本）。
+4. 新增 stub `PT_LOAD`，入口改到 stub。
+5. 重写 Program Header：将可恢复段对应的 `PT_LOAD` 改为 `PT_NULL`。
+6. 给 stub 打补丁（`OEP_ADDR`、`REGION_*`、`CONVEX_MIN_VADDR`、偏移信息等）。
+7. 运行时 stub 执行恢复并跳转原入口。
+
+## 3. 插入策略说明（重要）
+
+当前算法是“整块触发”：
+
+- `total_blocks = segment_size // block_size`
+- `inserted_bytes = total_blocks * insert_size`
+
+只有凑满一个完整 `block_size` 才会插入一次。  
+若段大小小于 `block_size`，该段 `total_blocks=0`，不会插入任何字节。
+
+这就是日志里出现“`共污染 0 个块`”的原因。
+
+## 4. 命令行参数
+
+常用参数：
+
+- `--input`：输入文件或目录。
+- `--output-dir`：输出目录（使用 `--input` 时必填）。
+- `--recursive`：递归处理目录。
+- `--suffix`：输出文件后缀，默认 `_packed`。
+- `--overwrite`：覆盖已存在输出。
+- `--block-size`：保留块大小（默认 `32`）。
+- `--insert-size`：每块后插入长度（默认 `64`）。
+- `--insert-type`：插入内容类型，`zero` 或 `nop`。
+- `--auto-build-stub`：自动构建 stub（不存在时建议开）。
+- `--rebuild-stub`：强制重建 stub。
+- `--stub-cc-x86-64/--stub-cc-i386/--stub-cc-arm/--stub-cc-aarch64`：指定各架构编译器。
+
+支持架构：`x86_64`、`i386`、`arm`、`aarch64`。
+
+## 5. 使用示例
+
+单文件：
+
+```bash
+python3 packer.py \
+  --input ../inject/hello \
+  --output-dir out/ \
+  --block-size 32 \
+  --insert-size 512 \
+  --insert-type zero \
+  --rebuild-stub
+```
+
+目录批量：
+
+```bash
+python3 packer.py \
+  --input ../inject/samples \
+  --output-dir out/ \
+  --recursive \
+  --overwrite
+```
+
+## 6. 日志解读
+
+常见字段含义：
+
+- `可污染段数 / 受保护段数`：分类结果。
+- `Program Header 重写: PT_NULL 化可恢复 PT_LOAD = N`：
+  已把 N 个可恢复段从首次加载映射中移除。
+- `REGION_COUNT = N`：stub 运行时将恢复 N 个段。
+- `共污染 X 个块`：实际发生插入污染的块数（由段大小和 `block-size` 决定）。
+
+## 7. 注意事项
+
+1. 若 `block-size` 过大，可能出现 `共污染 0 个块`，但流程仍会成功。
+2. `hello` 这类小样本建议用较小 `block-size`（如 `32/64/128`）。
+3. 输出文件属于“运行时恢复”模型，静态字节布局与原始文件不同。

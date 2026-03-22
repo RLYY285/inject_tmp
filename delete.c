@@ -360,12 +360,16 @@ static inline uaddr_t my_mmap(uaddr_t addr, uaddr_t len, int prot, int flags) {
     return (uaddr_t)ret;
 }
 
+static inline int mmap_failed(uaddr_t ret) {
+    return ((long)(intptr_t)ret) < 0;
+}
+
 /* alloc_temp: anonymous RWX page(s); exits on failure. */
 static inline uaddr_t alloc_temp(uaddr_t size) {
     uaddr_t page_size = 0x1000;
     uaddr_t aligned   = (size + page_size - 1) & ~(page_size - 1);
     uaddr_t addr = my_mmap(0, aligned, 7, 0x22 /*MAP_PRIVATE|MAP_ANON*/);
-    if (addr == (uaddr_t)-1 || addr == 0) fail_exit(2);
+    if (mmap_failed(addr) || addr == 0) fail_exit(2);
     return addr;
 }
 
@@ -376,7 +380,7 @@ static inline void map_fixed(uaddr_t target_addr, uaddr_t size) {
     uaddr_t aligned_size = end - aligned_addr;
     uaddr_t ret = my_mmap(aligned_addr, aligned_size,
                           7, 0x32 /*MAP_FIXED|MAP_PRIVATE|MAP_ANON*/);
-    if (ret == (uaddr_t)-1) fail_exit(3);
+    if (mmap_failed(ret) || ret != aligned_addr) fail_exit(3);
 }
 
 
@@ -500,8 +504,10 @@ static int compact_in_place(
 #if defined(ARCH_X64)
 
 static __attribute__((noinline)) void stub_main(void) {
-    uaddr_t convex_base = CONVEX_MIN_VADDR;
-    uaddr_t new_oep = OEP_ADDR;
+    uaddr_t runtime_addr_of_voffset = (uaddr_t)(uintptr_t)&STUB_VOFFSET;
+    uaddr_t load_base = runtime_addr_of_voffset - STUB_VOFFSET;
+    uaddr_t convex_base = load_base + CONVEX_MIN_VADDR;
+    uaddr_t new_oep = load_base + OEP_ADDR;
     uaddr_t count = REGION_COUNT;
     uaddr_t prot_count = PROTECTED_COUNT;
     uaddr_t i;
@@ -513,7 +519,7 @@ static __attribute__((noinline)) void stub_main(void) {
 
     /* Phase 1: recover polluted (recoverable) PT_LOAD regions */
     for (i = 0; i < count; i++) {
-        uaddr_t region_vaddr  = REGION_ADDRS[i];
+        uaddr_t region_vaddr  = load_base + REGION_ADDRS[i];
         uaddr_t region_size   = REGION_SIZES[i];
         uaddr_t retain        = REGION_RETAINS[i];
         uaddr_t del           = REGION_DELETES[i];
@@ -536,7 +542,7 @@ static __attribute__((noinline)) void stub_main(void) {
 
     /* Phase 2: copy protected (non-pollutable) PT_LOAD regions */
     for (i = 0; i < prot_count; i++) {
-        uaddr_t vaddr = PROTECTED_ADDRS[i];
+        uaddr_t vaddr = load_base + PROTECTED_ADDRS[i];
         uaddr_t size  = PROTECTED_SIZES[i];
         uaddr_t src   = convex_base + PROTECTED_OFFSETS[i];
 
@@ -556,8 +562,8 @@ static __attribute__((noinline)) void stub_main(void) {
             (uaddr_t)-1, &dummy
         );
         if (rc != 0) fail_exit(1);
-        map_fixed(HEADER_VADDR, HEADER_SIZE);
-        memcpy_safe((uint8_t *)HEADER_VADDR, (uint8_t *)hdr_temp, HEADER_SIZE);
+        map_fixed(load_base + HEADER_VADDR, HEADER_SIZE);
+        memcpy_safe((uint8_t *)(load_base + HEADER_VADDR), (uint8_t *)hdr_temp, HEADER_SIZE);
     }
 
     /* Phase 4: jump to OEP */
@@ -604,6 +610,7 @@ static inline uint8_t *get_stub_base(void) {
 
 static __attribute__((noinline)) void stub_main(uint8_t *stub_base) {
     volatile uint32_t *oep_ptr         = (volatile uint32_t*)(stub_base + OFF(OEP_ADDR));
+    volatile uint32_t *voffset_p       = (volatile uint32_t*)(stub_base + OFF(STUB_VOFFSET));
     volatile uint32_t *region_count_p  = (volatile uint32_t*)(stub_base + OFF(REGION_COUNT));
     volatile uint32_t *region_addrs_p  = (volatile uint32_t*)(stub_base + OFF(REGION_ADDRS));
     volatile uint32_t *region_sizes_p  = (volatile uint32_t*)(stub_base + OFF(REGION_SIZES));
@@ -625,8 +632,10 @@ static __attribute__((noinline)) void stub_main(uint8_t *stub_base) {
     volatile uint32_t *hdr_del_p       = (volatile uint32_t*)(stub_base + OFF(HEADER_DELETE));
     volatile uint32_t *hdr_blocks_p    = (volatile uint32_t*)(stub_base + OFF(HEADER_BLOCKS));
 
-    uint32_t new_oep    = *oep_ptr;
-    uint32_t convex_base = *convex_base_p;
+    uint32_t runtime_addr_of_voffset = (uint32_t)(uintptr_t)(stub_base + OFF(STUB_VOFFSET));
+    uint32_t load_base = runtime_addr_of_voffset - (*voffset_p);
+    uint32_t new_oep    = load_base + (*oep_ptr);
+    uint32_t convex_base = load_base + (*convex_base_p);
     uint32_t count      = *region_count_p;
     uint32_t prot_count = *prot_count_p;
     uint32_t i;
@@ -638,7 +647,7 @@ static __attribute__((noinline)) void stub_main(uint8_t *stub_base) {
 
     /* Phase 1: recover polluted PT_LOAD regions */
     for (i = 0; i < count; i++) {
-        uint32_t region_vaddr  = region_addrs_p[i];
+        uint32_t region_vaddr  = load_base + region_addrs_p[i];
         uint32_t region_size   = region_sizes_p[i];
         uint32_t retain        = region_retain_p[i];
         uint32_t del           = region_delete_p[i];
@@ -661,7 +670,7 @@ static __attribute__((noinline)) void stub_main(uint8_t *stub_base) {
 
     /* Phase 2: copy protected PT_LOAD regions */
     for (i = 0; i < prot_count; i++) {
-        uint32_t vaddr = prot_addrs_p[i];
+        uint32_t vaddr = load_base + prot_addrs_p[i];
         uint32_t size  = prot_sizes_p[i];
         uint32_t src   = convex_base + prot_offs_p[i];
 
@@ -681,8 +690,8 @@ static __attribute__((noinline)) void stub_main(uint8_t *stub_base) {
             (uaddr_t)-1, (uaddr_t *)&dummy
         );
         if (rc != 0) fail_exit(1);
-        map_fixed(*hdr_vaddr_p, *hdr_size_p);
-        memcpy_safe((uint8_t *)*hdr_vaddr_p, (uint8_t *)hdr_temp, *hdr_size_p);
+        map_fixed(load_base + *hdr_vaddr_p, *hdr_size_p);
+        memcpy_safe((uint8_t *)(load_base + *hdr_vaddr_p), (uint8_t *)hdr_temp, *hdr_size_p);
     }
 
     /* Phase 4: jump to OEP */
@@ -721,8 +730,10 @@ void _start(void) {
 #elif defined(ARCH_AARCH64)
 
 static __attribute__((noinline)) void stub_main(void) {
-    uaddr_t convex_base = CONVEX_MIN_VADDR;
-    uaddr_t new_oep    = OEP_ADDR;
+    uaddr_t runtime_addr_of_voffset = (uaddr_t)(uintptr_t)&STUB_VOFFSET;
+    uaddr_t load_base  = runtime_addr_of_voffset - STUB_VOFFSET;
+    uaddr_t convex_base = load_base + CONVEX_MIN_VADDR;
+    uaddr_t new_oep    = load_base + OEP_ADDR;
     uaddr_t count      = REGION_COUNT;
     uaddr_t prot_count = PROTECTED_COUNT;
     uaddr_t i;
@@ -734,7 +745,7 @@ static __attribute__((noinline)) void stub_main(void) {
 
     /* Phase 1: recover polluted PT_LOAD regions */
     for (i = 0; i < count; i++) {
-        uaddr_t region_vaddr  = REGION_ADDRS[i];
+        uaddr_t region_vaddr  = load_base + REGION_ADDRS[i];
         uaddr_t region_size   = REGION_SIZES[i];
         uaddr_t retain        = REGION_RETAINS[i];
         uaddr_t del           = REGION_DELETES[i];
@@ -757,7 +768,7 @@ static __attribute__((noinline)) void stub_main(void) {
 
     /* Phase 2: copy protected PT_LOAD regions */
     for (i = 0; i < prot_count; i++) {
-        uaddr_t vaddr = PROTECTED_ADDRS[i];
+        uaddr_t vaddr = load_base + PROTECTED_ADDRS[i];
         uaddr_t size  = PROTECTED_SIZES[i];
         uaddr_t src   = convex_base + PROTECTED_OFFSETS[i];
 
@@ -777,8 +788,8 @@ static __attribute__((noinline)) void stub_main(void) {
             (uaddr_t)-1, &dummy
         );
         if (rc != 0) fail_exit(1);
-        map_fixed(HEADER_VADDR, HEADER_SIZE);
-        memcpy_safe((uint8_t *)HEADER_VADDR, (uint8_t *)hdr_temp, HEADER_SIZE);
+        map_fixed(load_base + HEADER_VADDR, HEADER_SIZE);
+        memcpy_safe((uint8_t *)(load_base + HEADER_VADDR), (uint8_t *)hdr_temp, HEADER_SIZE);
     }
 
     /* Phase 4: jump to OEP */
@@ -829,8 +840,10 @@ __attribute__((naked)) void _start(void) {
 #elif defined(ARCH_ARM)
 
 static __attribute__((noinline)) void stub_main(void) {
-    uaddr_t convex_base = CONVEX_MIN_VADDR;
-    uaddr_t new_oep    = OEP_ADDR;
+    uaddr_t runtime_addr_of_voffset = (uaddr_t)(uintptr_t)&STUB_VOFFSET;
+    uaddr_t load_base  = runtime_addr_of_voffset - STUB_VOFFSET;
+    uaddr_t convex_base = load_base + CONVEX_MIN_VADDR;
+    uaddr_t new_oep    = load_base + OEP_ADDR;
     uaddr_t count      = REGION_COUNT;
     uaddr_t prot_count = PROTECTED_COUNT;
     uaddr_t i;
@@ -842,7 +855,7 @@ static __attribute__((noinline)) void stub_main(void) {
 
     /* Phase 1: recover polluted PT_LOAD regions */
     for (i = 0; i < count; i++) {
-        uaddr_t region_vaddr  = REGION_ADDRS[i];
+        uaddr_t region_vaddr  = load_base + REGION_ADDRS[i];
         uaddr_t region_size   = REGION_SIZES[i];
         uaddr_t retain        = REGION_RETAINS[i];
         uaddr_t del           = REGION_DELETES[i];
@@ -865,7 +878,7 @@ static __attribute__((noinline)) void stub_main(void) {
 
     /* Phase 2: copy protected PT_LOAD regions */
     for (i = 0; i < prot_count; i++) {
-        uaddr_t vaddr = PROTECTED_ADDRS[i];
+        uaddr_t vaddr = load_base + PROTECTED_ADDRS[i];
         uaddr_t size  = PROTECTED_SIZES[i];
         uaddr_t src   = convex_base + PROTECTED_OFFSETS[i];
 
@@ -885,8 +898,8 @@ static __attribute__((noinline)) void stub_main(void) {
             (uaddr_t)-1, (uaddr_t *)&dummy
         );
         if (rc != 0) fail_exit(1);
-        map_fixed(HEADER_VADDR, HEADER_SIZE);
-        memcpy_safe((uint8_t *)HEADER_VADDR, (uint8_t *)hdr_temp, HEADER_SIZE);
+        map_fixed(load_base + HEADER_VADDR, HEADER_SIZE);
+        memcpy_safe((uint8_t *)(load_base + HEADER_VADDR), (uint8_t *)hdr_temp, HEADER_SIZE);
     }
 
     /* Phase 4: jump to OEP */
