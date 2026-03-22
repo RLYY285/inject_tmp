@@ -386,10 +386,8 @@ def _nullify_recoverable_ptloads(
     if not recoverable_infos:
         return 0
 
-    targets = {
-        (int(r['vaddr']) + int(vaddr_shift), int(r['size']))
-        for r in recoverable_infos
-    }
+    # Match by vaddr only; p_filesz may be 0 when original data was cleared.
+    target_vaddrs = {int(r['vaddr']) + int(vaddr_shift) for r in recoverable_infos}
 
     endian, e_phoff, e_phentsize, e_phnum = _elf_phdr_layout(output_file, is64)
     removed = 0
@@ -408,23 +406,14 @@ def _nullify_recoverable_ptloads(
 
             if is64:
                 p_vaddr = struct.unpack_from(endian + 'Q', ph, 16)[0]
-                p_filesz = struct.unpack_from(endian + 'Q', ph, 32)[0]
-                p_memsz = struct.unpack_from(endian + 'Q', ph, 40)[0]
             else:
                 p_vaddr = struct.unpack_from(endian + 'I', ph, 8)[0]
-                p_filesz = struct.unpack_from(endian + 'I', ph, 16)[0]
-                p_memsz = struct.unpack_from(endian + 'I', ph, 20)[0]
 
-            for tvaddr, tsize in targets:
-                if int(p_vaddr) != int(tvaddr):
-                    continue
-                if int(p_filesz) < int(tsize) or int(p_memsz) < int(tsize):
-                    continue
+            if int(p_vaddr) in target_vaddrs:
                 # p_type -> PT_NULL
                 f.seek(ph_off)
                 f.write(struct.pack(endian + 'I', 0))
                 removed += 1
-                break
 
     return removed
 
@@ -687,11 +676,16 @@ def create_convex_hull_elf(
         stub_entry_offset: int,
         stub_blob: bytes,
         is64: bool,
+        recoverable_infos: list[dict] | None = None,
 ) -> tuple[lief.ELF.Binary, int, int, int]:
     """
     Preserve the original ELF program-header layout (incl. PT_INTERP/PT_DYNAMIC)
     and add one extra convex PT_LOAD that stores:
         [stub_blob][convex_content]
+
+    When recoverable_infos is provided, the content of those PT_LOAD segments is
+    cleared before writing so that the original plaintext data is not duplicated
+    in the output file (the stub restores it at runtime from convex_content).
 
     Returns:
         (new_binary, convex_va, entry_vaddr, relocated_original_oep)
@@ -700,6 +694,21 @@ def create_convex_hull_elf(
     new_binary = lief.parse(str(source_path))
     if not new_binary:
         raise RuntimeError(f"[-] 无法重新解析 ELF: {source_path}")
+
+    # Remove original data for recoverable segments so the output file does not
+    # contain a redundant plaintext copy.  The stub will restore these regions
+    # at runtime from the polluted convex_content.
+    if recoverable_infos:
+        recoverable_vaddrs = {int(r['vaddr']) for r in recoverable_infos}
+        for seg in new_binary.segments:
+            if seg.type != lief.ELF.Segment.TYPE.LOAD:
+                continue
+            if int(seg.virtual_address) in recoverable_vaddrs:
+                # Clear the segment's file content (sets p_filesz → 0 in the
+                # output).  The segment header (vaddr, memsz, flags) is kept so
+                # the stub can still locate and restore the region.  LIEF will
+                # not write any bytes for this segment, reducing file size.
+                seg.content = []
 
     combined = stub_blob + convex_content
 
@@ -919,7 +928,8 @@ def pack_with_convex_hull(target_file: Path,
     try:
         new_binary, convex_va, entry_vaddr, relocated_oep = create_convex_hull_elf(
             target_file, binary, convex_info, convex_content,
-            stub_entry_offset, stub_blob, is64
+            stub_entry_offset, stub_blob, is64,
+            recoverable_infos,
         )
         vaddr_shift = int(relocated_oep) - int(original_oep_before_layout)
         print(f'     原始 OEP（重排后）: {hex(relocated_oep)}')
