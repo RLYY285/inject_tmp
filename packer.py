@@ -376,7 +376,9 @@ def _nullify_recoverable_ptloads(
         is64: bool,
         recoverable_infos: list[dict],
         vaddr_shift: int,
-) -> int:
+        strip_plaintext: bool,
+        prune_pages: bool,
+) -> tuple[int, int, str]:
     """
     Rewrite output ELF program headers: convert recoverable PT_LOAD to PT_NULL.
 
@@ -384,7 +386,7 @@ def _nullify_recoverable_ptloads(
     regions are restored by stub at runtime (UPX-like behavior).
     """
     if not recoverable_infos:
-        return 0
+        return 0, 0, 'none'
 
     targets = {
         (int(r['vaddr']) + int(vaddr_shift), int(r['size']))
@@ -392,41 +394,253 @@ def _nullify_recoverable_ptloads(
     }
 
     endian, e_phoff, e_phentsize, e_phnum = _elf_phdr_layout(output_file, is64)
-    removed = 0
+    expected_phentsize = 56 if is64 else 32
+    if e_phentsize < expected_phentsize:
+        raise RuntimeError(f'[-] 异常 Program Header 大小: {e_phentsize}')
 
-    with open(output_file, 'r+b') as f:
-        for i in range(e_phnum):
-            ph_off = e_phoff + i * e_phentsize
-            f.seek(ph_off)
-            ph = f.read(e_phentsize)
-            if len(ph) < e_phentsize:
-                raise RuntimeError('[-] Program Header 读取失败')
+    with open(output_file, 'rb') as f:
+        data = bytearray(f.read())
 
-            p_type = struct.unpack_from(endian + 'I', ph, 0)[0]
-            if p_type != 1:  # PT_LOAD
+    file_size = len(data)
+    nulled = 0
+    changed_bytes = 0
+    target_ph_indices: set[int] = set()
+    remove_ranges: list[tuple[int, int]] = []
+    all_ph: list[dict] = []
+
+    def _read_u(ph: bytes, off: int, width: int) -> int:
+        if width == 8:
+            return struct.unpack_from(endian + 'Q', ph, off)[0]
+        return struct.unpack_from(endian + 'I', ph, off)[0]
+
+    off_p_type = 0
+    off_p_offset = 8 if is64 else 4
+    off_p_vaddr = 16 if is64 else 8
+    off_p_filesz = 32 if is64 else 16
+    off_p_memsz = 40 if is64 else 20
+    off_p_align = 48 if is64 else 28
+    width = 8 if is64 else 4
+
+    for i in range(e_phnum):
+        ph_off = e_phoff + i * e_phentsize
+        ph = bytes(data[ph_off:ph_off + e_phentsize])
+        if len(ph) < e_phentsize:
+            raise RuntimeError('[-] Program Header 读取失败')
+
+        p_type = struct.unpack_from(endian + 'I', ph, off_p_type)[0]
+        p_offset = _read_u(ph, off_p_offset, width)
+        p_vaddr = _read_u(ph, off_p_vaddr, width)
+        p_filesz = _read_u(ph, off_p_filesz, width)
+        p_memsz = _read_u(ph, off_p_memsz, width)
+        p_align = _read_u(ph, off_p_align, width)
+
+        all_ph.append({
+            'index': i,
+            'ph_off': ph_off,
+            'type': int(p_type),
+            'offset': int(p_offset),
+            'vaddr': int(p_vaddr),
+            'filesz': int(p_filesz),
+            'memsz': int(p_memsz),
+            'align': int(p_align),
+        })
+
+    for ph in all_ph:
+        if ph['type'] != 1:  # PT_LOAD
+            continue
+        for tvaddr, tsize in targets:
+            if ph['vaddr'] != int(tvaddr):
                 continue
+            if ph['filesz'] < int(tsize) or ph['memsz'] < int(tsize):
+                continue
+            target_ph_indices.add(ph['index'])
+            if strip_plaintext and ph['filesz'] > 0:
+                start = ph['offset']
+                end = ph['offset'] + ph['filesz']
+                if start < 0 or end > file_size or end < start:
+                    raise RuntimeError(f'[-] 待裁剪范围越界: idx={ph["index"]} off={start} size={ph["filesz"]}')
+                remove_ranges.append((start, end))
+            break
 
-            if is64:
-                p_vaddr = struct.unpack_from(endian + 'Q', ph, 16)[0]
-                p_filesz = struct.unpack_from(endian + 'Q', ph, 32)[0]
-                p_memsz = struct.unpack_from(endian + 'Q', ph, 40)[0]
+    # PT_NULL + zero sizes/offset for recoverable PT_LOAD
+    for ph in all_ph:
+        if ph['index'] not in target_ph_indices:
+            continue
+        ph_off = ph['ph_off']
+        data[ph_off:ph_off + 4] = struct.pack(endian + 'I', 0)  # PT_NULL
+        data[ph_off + off_p_offset:ph_off + off_p_offset + width] = struct.pack(endian + ('Q' if is64 else 'I'), 0)
+        data[ph_off + off_p_filesz:ph_off + off_p_filesz + width] = struct.pack(endian + ('Q' if is64 else 'I'), 0)
+        data[ph_off + off_p_memsz:ph_off + off_p_memsz + width] = struct.pack(endian + ('Q' if is64 else 'I'), 0)
+        nulled += 1
+
+    mode = 'none'
+    if strip_plaintext and remove_ranges:
+        remove_ranges.sort()
+        merged: list[tuple[int, int]] = []
+        for start, end in remove_ranges:
+            if not merged or start > merged[-1][1]:
+                merged.append((start, end))
             else:
-                p_vaddr = struct.unpack_from(endian + 'I', ph, 8)[0]
-                p_filesz = struct.unpack_from(endian + 'I', ph, 16)[0]
-                p_memsz = struct.unpack_from(endian + 'I', ph, 20)[0]
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
 
-            for tvaddr, tsize in targets:
-                if int(p_vaddr) != int(tvaddr):
-                    continue
-                if int(p_filesz) < int(tsize) or int(p_memsz) < int(tsize):
-                    continue
-                # p_type -> PT_NULL
-                f.seek(ph_off)
-                f.write(struct.pack(endian + 'I', 0))
-                removed += 1
-                break
+        if prune_pages:
+            page = 0x1000
+            droppable_non_load_types = {
+                4,           # PT_NOTE
+                0x6474E550,  # PT_GNU_EH_FRAME
+                0x6474E553,  # PT_GNU_PROPERTY
+            }
 
-    return removed
+            # Candidate prune pages: pages touched by recoverable plaintext ranges.
+            candidate_pages: list[tuple[int, int]] = []
+            for start, end in merged:
+                p0 = (start // page) * page
+                p1 = ((end + page - 1) // page) * page
+                for p in range(p0, p1, page):
+                    candidate_pages.append((p, p + page))
+
+            # Keep unique, sorted pages.
+            candidate_pages = sorted(set(candidate_pages))
+
+            def overlaps(a0: int, a1: int, b0: int, b1: int) -> bool:
+                return max(a0, b0) < min(a1, b1)
+
+            # critical file ranges that cannot be pruned
+            e_ph_end = e_phoff + e_phnum * e_phentsize
+            critical_ranges = [(0, max(0x40, e_ph_end))]
+            for ph in all_ph:
+                if ph['index'] in target_ph_indices:
+                    continue
+                if ph['filesz'] <= 0 or ph['offset'] <= 0:
+                    continue
+                if ph['type'] in droppable_non_load_types:
+                    continue
+                critical_ranges.append((ph['offset'], ph['offset'] + ph['filesz']))
+
+            safe_pages: list[tuple[int, int]] = []
+            for a, b in candidate_pages:
+                if a < 0 or b > file_size:
+                    continue
+                if any(overlaps(a, b, c0, c1) for c0, c1 in critical_ranges):
+                    continue
+                safe_pages.append((a, b))
+
+            # merge contiguous safe pages
+            prune_ranges: list[tuple[int, int]] = []
+            for start, end in safe_pages:
+                if not prune_ranges or start > prune_ranges[-1][1]:
+                    prune_ranges.append((start, end))
+                else:
+                    prune_ranges[-1] = (prune_ranges[-1][0], max(prune_ranges[-1][1], end))
+
+            if prune_ranges:
+                def removed_before(pos: int) -> int:
+                    s = 0
+                    for a, b in prune_ranges:
+                        if b <= pos:
+                            s += (b - a)
+                        else:
+                            break
+                    return s
+
+                def inside_removed(pos: int) -> bool:
+                    for a, b in prune_ranges:
+                        if a <= pos < b:
+                            return True
+                        if pos < a:
+                            return False
+                    return False
+
+                # for remaining PT_LOAD, ensure new offset keeps congruence
+                for ph in all_ph:
+                    if ph['index'] in target_ph_indices or ph['type'] != 1:
+                        continue
+                    if ph['filesz'] <= 0:
+                        continue
+                    if inside_removed(ph['offset']):
+                        raise RuntimeError(
+                            f'[-] 页级裁剪冲突：保留 PT_LOAD idx={ph["index"]} 起始偏移落入裁剪页'
+                        )
+                    new_off = ph['offset'] - removed_before(ph['offset'])
+                    align = ph['align'] if ph['align'] > 1 else 1
+                    if (new_off % align) != (ph['vaddr'] % align):
+                        raise RuntimeError(
+                            f'[-] 页级裁剪后对齐失配: idx={ph["index"]} '
+                            f'new_off={hex(new_off)} align={hex(align)} vaddr={hex(ph["vaddr"])}'
+                        )
+
+                # non-critical non-load segments landing in removed pages -> PT_NULL
+                for ph in all_ph:
+                    if ph['index'] in target_ph_indices:
+                        continue
+                    if ph['offset'] <= 0 or ph['filesz'] <= 0:
+                        continue
+                    if not inside_removed(ph['offset']):
+                        continue
+                    if ph['type'] not in droppable_non_load_types:
+                        raise RuntimeError(
+                            f'[-] 页级裁剪冲突：关键段 idx={ph["index"]} type={hex(ph["type"])} 落入裁剪页'
+                        )
+                    ph_off = ph['ph_off']
+                    data[ph_off:ph_off + 4] = struct.pack(endian + 'I', 0)
+                    data[ph_off + off_p_offset:ph_off + off_p_offset + width] = struct.pack(endian + ('Q' if is64 else 'I'), 0)
+                    data[ph_off + off_p_filesz:ph_off + off_p_filesz + width] = struct.pack(endian + ('Q' if is64 else 'I'), 0)
+                    data[ph_off + off_p_memsz:ph_off + off_p_memsz + width] = struct.pack(endian + ('Q' if is64 else 'I'), 0)
+
+                # rewrite p_offset for remaining entries
+                for ph in all_ph:
+                    if ph['index'] in target_ph_indices:
+                        continue
+                    if ph['offset'] <= 0:
+                        continue
+                    if inside_removed(ph['offset']):
+                        continue
+                    new_off = ph['offset'] - removed_before(ph['offset'])
+                    if new_off == ph['offset']:
+                        continue
+                    ph_off = ph['ph_off']
+                    data[ph_off + off_p_offset:ph_off + off_p_offset + width] = \
+                        struct.pack(endian + ('Q' if is64 else 'I'), new_off)
+
+                # drop section headers in pruned file
+                if is64:
+                    data[0x28:0x30] = struct.pack(endian + 'Q', 0)
+                    data[0x3A:0x3C] = struct.pack(endian + 'H', 0)
+                    data[0x3C:0x3E] = struct.pack(endian + 'H', 0)
+                    data[0x3E:0x40] = struct.pack(endian + 'H', 0)
+                else:
+                    data[0x20:0x24] = struct.pack(endian + 'I', 0)
+                    data[0x2E:0x30] = struct.pack(endian + 'H', 0)
+                    data[0x30:0x32] = struct.pack(endian + 'H', 0)
+                    data[0x32:0x34] = struct.pack(endian + 'H', 0)
+
+                # compact bytes
+                chunks: list[bytes] = []
+                cur = 0
+                for start, end in prune_ranges:
+                    if cur < start:
+                        chunks.append(bytes(data[cur:start]))
+                    cur = end
+                if cur < len(data):
+                    chunks.append(bytes(data[cur:]))
+                data = bytearray(b''.join(chunks))
+                changed_bytes = sum((b - a) for a, b in prune_ranges)
+                mode = 'prune'
+
+        if mode == 'none':
+            # Fallback: overwrite plaintext bytes.
+            for start, end in merged:
+                length = end - start
+                if length <= 0:
+                    continue
+                data[start:end] = b'\xA5' * length
+                changed_bytes += length
+            mode = 'wipe'
+
+    with open(output_file, 'wb') as f:
+        f.write(data)
+
+    return nulled, changed_bytes, mode
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -813,6 +1027,8 @@ def pack_with_convex_hull(target_file: Path,
                           block_size: int,
                           insert_size: int,
                           insert_type: str,
+                          strip_recoverable_plaintext: bool,
+                          prune_recoverable_pages: bool,
                           auto_build_stub: bool,
                           rebuild_stub: bool,
                           stub_compilers: dict[str, str],
@@ -941,13 +1157,20 @@ def pack_with_convex_hull(target_file: Path,
     # - 将可恢复 PT_LOAD 失活（PT_NULL）
     # - 运行时由 stub 从 convex 段恢复并 map 回目标虚拟地址
     try:
-        nulled = _nullify_recoverable_ptloads(
+        nulled, changed, mode = _nullify_recoverable_ptloads(
             output_file=output_file,
             is64=is64,
             recoverable_infos=recoverable_infos,
             vaddr_shift=vaddr_shift,
+            strip_plaintext=strip_recoverable_plaintext,
+            prune_pages=prune_recoverable_pages,
         )
         print(f'   Program Header 重写: PT_NULL 化可恢复 PT_LOAD = {nulled}')
+        if strip_recoverable_plaintext:
+            if mode == 'prune':
+                print(f'   页级裁剪: 裁剪可恢复段相关页面 = {changed} 字节')
+            elif mode == 'wipe':
+                print(f'   明文覆写: 覆写可恢复段原始字节 = {changed} 字节')
     except Exception as e:
         print(f'[-] 重写 Program Header 失败: {e}')
         return False
@@ -1035,6 +1258,10 @@ def main():
     parser.add_argument('--block-size', type=int, default=32, help='原始块大小（字节）')
     parser.add_argument('--insert-size', type=int, default=64, help='插入块大小（字节）')
     parser.add_argument('--insert-type', choices=['zero', 'nop'], default='nop', help='插入内容类型')
+    parser.add_argument('--keep-recoverable-plaintext', action='store_true',
+                        help='保留原可恢复段明文字节（默认会裁剪去除，更接近 UPX）')
+    parser.add_argument('--prune-recoverable-pages', action='store_true',
+                        help='启用页级裁剪（按 0x1000 页重排），不可裁剪时回退为明文覆写')
     parser.add_argument('--auto-build-stub', action='store_true', help='自动构建 stub')
     parser.add_argument('--rebuild-stub', action='store_true', help='强制重建 stub')
     parser.add_argument('--stub-cc-x86-64', default=ARCH_SPECS["x86_64"]["default_cc"], help='x86_64 stub 编译器')
@@ -1062,6 +1289,8 @@ def main():
         pack_with_convex_hull(
             target_file, output_file, temp_file,
             args.block_size, args.insert_size, args.insert_type,
+            not args.keep_recoverable_plaintext,
+            args.prune_recoverable_pages,
             args.auto_build_stub, args.rebuild_stub,
             stub_compilers, verify_recovery
         )
@@ -1104,6 +1333,8 @@ def main():
             if pack_with_convex_hull(
                 p, out_path, temp_path,
                 args.block_size, args.insert_size, args.insert_type,
+                not args.keep_recoverable_plaintext,
+                args.prune_recoverable_pages,
                 args.auto_build_stub, args.rebuild_stub,
                 stub_compilers, verify_recovery
             ):
