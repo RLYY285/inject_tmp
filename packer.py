@@ -10,9 +10,11 @@ ELF 打包器：凸包模式（UPX 风格）
 """
 
 import argparse
+import json
 import subprocess
 import shutil
 import struct
+from datetime import datetime, timezone
 from pathlib import Path
 
 import lief
@@ -377,6 +379,7 @@ def _nullify_recoverable_ptloads(
         recoverable_infos: list[dict],
         vaddr_shift: int,
         strip_plaintext: bool,
+        prune_bytes: bool,
         prune_pages: bool,
 ) -> tuple[int, int, str]:
     """
@@ -475,21 +478,205 @@ def _nullify_recoverable_ptloads(
 
     mode = 'none'
     if strip_plaintext and remove_ranges:
-        remove_ranges.sort()
-        merged: list[tuple[int, int]] = []
-        for start, end in remove_ranges:
-            if not merged or start > merged[-1][1]:
-                merged.append((start, end))
-            else:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        droppable_non_load_types = {
+            4,           # PT_NOTE
+            0x6474E550,  # PT_GNU_EH_FRAME
+            0x6474E553,  # PT_GNU_PROPERTY
+        }
 
-        if prune_pages:
+        def merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+            if not ranges:
+                return []
+            ranges = sorted(ranges)
+            merged_out: list[tuple[int, int]] = []
+            for start, end in ranges:
+                if end <= start:
+                    continue
+                if not merged_out or start > merged_out[-1][1]:
+                    merged_out.append((start, end))
+                else:
+                    merged_out[-1] = (merged_out[-1][0], max(merged_out[-1][1], end))
+            return merged_out
+
+        def overlaps(a0: int, a1: int, b0: int, b1: int) -> bool:
+            return max(a0, b0) < min(a1, b1)
+
+        def overlap_len(start: int, end: int, ranges: list[tuple[int, int]]) -> int:
+            total = 0
+            for a, b in ranges:
+                if b <= start:
+                    continue
+                if a >= end:
+                    break
+                total += max(0, min(end, b) - max(start, a))
+            return total
+
+        def subtract_ranges(
+                ranges: list[tuple[int, int]],
+                cuts: list[tuple[int, int]]
+        ) -> list[tuple[int, int]]:
+            src = merge_ranges(ranges)
+            sub = merge_ranges(cuts)
+            if not src:
+                return []
+            if not sub:
+                return src
+
+            out: list[tuple[int, int]] = []
+            for start, end in src:
+                cur = start
+                for c0, c1 in sub:
+                    if c1 <= cur:
+                        continue
+                    if c0 >= end:
+                        break
+                    if c0 > cur:
+                        out.append((cur, min(c0, end)))
+                    if c1 >= end:
+                        cur = end
+                        break
+                    cur = max(cur, c1)
+                if cur < end:
+                    out.append((cur, end))
+            return merge_ranges(out)
+
+        def removed_before(pos: int, ranges: list[tuple[int, int]]) -> int:
+            s = 0
+            for a, b in ranges:
+                if b <= pos:
+                    s += (b - a)
+                else:
+                    break
+            return s
+
+        def inside_removed(pos: int, ranges: list[tuple[int, int]]) -> bool:
+            for a, b in ranges:
+                if a <= pos < b:
+                    return True
+                if pos < a:
+                    return False
+            return False
+
+        def apply_prune_ranges(prune_ranges: list[tuple[int, int]]) -> int:
+            nonlocal data
+            chunks: list[bytes] = []
+            cur = 0
+            for start, end in prune_ranges:
+                if cur < start:
+                    chunks.append(bytes(data[cur:start]))
+                cur = end
+            if cur < len(data):
+                chunks.append(bytes(data[cur:]))
+            data = bytearray(b''.join(chunks))
+            return sum((b - a) for a, b in prune_ranges)
+
+        def drop_section_headers() -> None:
+            if is64:
+                data[0x28:0x30] = struct.pack(endian + 'Q', 0)
+                data[0x3A:0x3C] = struct.pack(endian + 'H', 0)
+                data[0x3C:0x3E] = struct.pack(endian + 'H', 0)
+                data[0x3E:0x40] = struct.pack(endian + 'H', 0)
+            else:
+                data[0x20:0x24] = struct.pack(endian + 'I', 0)
+                data[0x2E:0x30] = struct.pack(endian + 'H', 0)
+                data[0x30:0x32] = struct.pack(endian + 'H', 0)
+                data[0x32:0x34] = struct.pack(endian + 'H', 0)
+
+        merged = merge_ranges(remove_ranges)
+
+        if prune_bytes:
+            e_ph_end = e_phoff + e_phnum * e_phentsize
+            critical_ranges = [(0, max(0x40, e_ph_end))]
+            droppable_candidates: list[dict] = []
+            for ph in all_ph:
+                if ph['index'] in target_ph_indices:
+                    continue
+                if ph['filesz'] <= 0 or ph['offset'] <= 0:
+                    continue
+                if ph['type'] in droppable_non_load_types:
+                    droppable_candidates.append(ph)
+                    continue
+                critical_ranges.append((ph['offset'], ph['offset'] + ph['filesz']))
+
+            prune_ranges = subtract_ranges(merged, critical_ranges)
+
+            partial_droppable_ranges: list[tuple[int, int]] = []
+            droppable_drop_indices: set[int] = set()
+            for ph in droppable_candidates:
+                s = ph['offset']
+                e = ph['offset'] + ph['filesz']
+                ov = overlap_len(s, e, prune_ranges)
+                if ov <= 0:
+                    continue
+                if ov == ph['filesz']:
+                    droppable_drop_indices.add(ph['index'])
+                else:
+                    partial_droppable_ranges.append((s, e))
+
+            if partial_droppable_ranges:
+                prune_ranges = subtract_ranges(prune_ranges, partial_droppable_ranges)
+
+            confirmed_droppable: set[int] = set()
+            for ph in droppable_candidates:
+                if ph['index'] not in droppable_drop_indices:
+                    continue
+                s = ph['offset']
+                e = ph['offset'] + ph['filesz']
+                if overlap_len(s, e, prune_ranges) == ph['filesz']:
+                    confirmed_droppable.add(ph['index'])
+
+            byte_prune_ok = bool(prune_ranges)
+            if byte_prune_ok:
+                for ph in all_ph:
+                    if ph['index'] in target_ph_indices or ph['index'] in confirmed_droppable:
+                        continue
+                    if ph['offset'] <= 0 or ph['filesz'] <= 0:
+                        continue
+
+                    seg_start = ph['offset']
+                    seg_end = ph['offset'] + ph['filesz']
+                    if overlap_len(seg_start, seg_end, prune_ranges) > 0:
+                        byte_prune_ok = False
+                        break
+
+                    if ph['type'] == 1:  # PT_LOAD
+                        if inside_removed(seg_start, prune_ranges):
+                            byte_prune_ok = False
+                            break
+                        new_off = seg_start - removed_before(seg_start, prune_ranges)
+                        align = ph['align'] if ph['align'] > 1 else 1
+                        if (new_off % align) != (ph['vaddr'] % align):
+                            byte_prune_ok = False
+                            break
+
+            if byte_prune_ok:
+                for ph in all_ph:
+                    if ph['index'] not in confirmed_droppable:
+                        continue
+                    ph_off = ph['ph_off']
+                    data[ph_off:ph_off + 4] = struct.pack(endian + 'I', 0)
+                    data[ph_off + off_p_offset:ph_off + off_p_offset + width] = struct.pack(endian + ('Q' if is64 else 'I'), 0)
+                    data[ph_off + off_p_filesz:ph_off + off_p_filesz + width] = struct.pack(endian + ('Q' if is64 else 'I'), 0)
+                    data[ph_off + off_p_memsz:ph_off + off_p_memsz + width] = struct.pack(endian + ('Q' if is64 else 'I'), 0)
+
+                for ph in all_ph:
+                    if ph['index'] in target_ph_indices or ph['index'] in confirmed_droppable:
+                        continue
+                    if ph['offset'] <= 0:
+                        continue
+                    new_off = ph['offset'] - removed_before(ph['offset'], prune_ranges)
+                    if new_off == ph['offset']:
+                        continue
+                    ph_off = ph['ph_off']
+                    data[ph_off + off_p_offset:ph_off + off_p_offset + width] = \
+                        struct.pack(endian + ('Q' if is64 else 'I'), new_off)
+
+                drop_section_headers()
+                changed_bytes = apply_prune_ranges(prune_ranges)
+                mode = 'byte-prune'
+
+        if mode == 'none' and prune_pages:
             page = 0x1000
-            droppable_non_load_types = {
-                4,           # PT_NOTE
-                0x6474E550,  # PT_GNU_EH_FRAME
-                0x6474E553,  # PT_GNU_PROPERTY
-            }
 
             # Candidate prune pages: pages touched by recoverable plaintext ranges.
             candidate_pages: list[tuple[int, int]] = []
@@ -501,9 +688,6 @@ def _nullify_recoverable_ptloads(
 
             # Keep unique, sorted pages.
             candidate_pages = sorted(set(candidate_pages))
-
-            def overlaps(a0: int, a1: int, b0: int, b1: int) -> bool:
-                return max(a0, b0) < min(a1, b1)
 
             # critical file ranges that cannot be pruned
             e_ph_end = e_phoff + e_phnum * e_phentsize
@@ -526,42 +710,20 @@ def _nullify_recoverable_ptloads(
                 safe_pages.append((a, b))
 
             # merge contiguous safe pages
-            prune_ranges: list[tuple[int, int]] = []
-            for start, end in safe_pages:
-                if not prune_ranges or start > prune_ranges[-1][1]:
-                    prune_ranges.append((start, end))
-                else:
-                    prune_ranges[-1] = (prune_ranges[-1][0], max(prune_ranges[-1][1], end))
+            prune_ranges = merge_ranges(safe_pages)
 
             if prune_ranges:
-                def removed_before(pos: int) -> int:
-                    s = 0
-                    for a, b in prune_ranges:
-                        if b <= pos:
-                            s += (b - a)
-                        else:
-                            break
-                    return s
-
-                def inside_removed(pos: int) -> bool:
-                    for a, b in prune_ranges:
-                        if a <= pos < b:
-                            return True
-                        if pos < a:
-                            return False
-                    return False
-
                 # for remaining PT_LOAD, ensure new offset keeps congruence
                 for ph in all_ph:
                     if ph['index'] in target_ph_indices or ph['type'] != 1:
                         continue
                     if ph['filesz'] <= 0:
                         continue
-                    if inside_removed(ph['offset']):
+                    if inside_removed(ph['offset'], prune_ranges):
                         raise RuntimeError(
                             f'[-] 页级裁剪冲突：保留 PT_LOAD idx={ph["index"]} 起始偏移落入裁剪页'
                         )
-                    new_off = ph['offset'] - removed_before(ph['offset'])
+                    new_off = ph['offset'] - removed_before(ph['offset'], prune_ranges)
                     align = ph['align'] if ph['align'] > 1 else 1
                     if (new_off % align) != (ph['vaddr'] % align):
                         raise RuntimeError(
@@ -575,7 +737,7 @@ def _nullify_recoverable_ptloads(
                         continue
                     if ph['offset'] <= 0 or ph['filesz'] <= 0:
                         continue
-                    if not inside_removed(ph['offset']):
+                    if not inside_removed(ph['offset'], prune_ranges):
                         continue
                     if ph['type'] not in droppable_non_load_types:
                         raise RuntimeError(
@@ -593,38 +755,17 @@ def _nullify_recoverable_ptloads(
                         continue
                     if ph['offset'] <= 0:
                         continue
-                    if inside_removed(ph['offset']):
+                    if inside_removed(ph['offset'], prune_ranges):
                         continue
-                    new_off = ph['offset'] - removed_before(ph['offset'])
+                    new_off = ph['offset'] - removed_before(ph['offset'], prune_ranges)
                     if new_off == ph['offset']:
                         continue
                     ph_off = ph['ph_off']
                     data[ph_off + off_p_offset:ph_off + off_p_offset + width] = \
                         struct.pack(endian + ('Q' if is64 else 'I'), new_off)
 
-                # drop section headers in pruned file
-                if is64:
-                    data[0x28:0x30] = struct.pack(endian + 'Q', 0)
-                    data[0x3A:0x3C] = struct.pack(endian + 'H', 0)
-                    data[0x3C:0x3E] = struct.pack(endian + 'H', 0)
-                    data[0x3E:0x40] = struct.pack(endian + 'H', 0)
-                else:
-                    data[0x20:0x24] = struct.pack(endian + 'I', 0)
-                    data[0x2E:0x30] = struct.pack(endian + 'H', 0)
-                    data[0x30:0x32] = struct.pack(endian + 'H', 0)
-                    data[0x32:0x34] = struct.pack(endian + 'H', 0)
-
-                # compact bytes
-                chunks: list[bytes] = []
-                cur = 0
-                for start, end in prune_ranges:
-                    if cur < start:
-                        chunks.append(bytes(data[cur:start]))
-                    cur = end
-                if cur < len(data):
-                    chunks.append(bytes(data[cur:]))
-                data = bytearray(b''.join(chunks))
-                changed_bytes = sum((b - a) for a, b in prune_ranges)
+                drop_section_headers()
+                changed_bytes = apply_prune_ranges(prune_ranges)
                 mode = 'prune'
 
         if mode == 'none':
@@ -1028,30 +1169,53 @@ def pack_with_convex_hull(target_file: Path,
                           insert_size: int,
                           insert_type: str,
                           strip_recoverable_plaintext: bool,
+                          prune_recoverable_bytes: bool,
                           prune_recoverable_pages: bool,
                           auto_build_stub: bool,
                           rebuild_stub: bool,
                           stub_compilers: dict[str, str],
-                          verify_recovery: bool) -> bool:
+                          verify_recovery: bool) -> tuple[bool, dict]:
     """
     使用凸包方式打包 ELF
     """
+    status = {
+        'input': str(target_file),
+        'output': str(output_file),
+        'success': False,
+        'error': '',
+        'arch': None,
+        'is_64bit': None,
+        'block_size': int(block_size),
+        'insert_size': int(insert_size),
+        'insert_type': str(insert_type),
+        'strip_recoverable_plaintext': bool(strip_recoverable_plaintext),
+        'prune_recoverable_bytes': bool(prune_recoverable_bytes),
+        'prune_recoverable_pages': bool(prune_recoverable_pages),
+        'verify_recovery': bool(verify_recovery),
+    }
+
+    def fail(error: str) -> tuple[bool, dict]:
+        status['error'] = str(error)
+        return False, status
+
     print(f'[*] 处理文件（凸包模式）: {target_file}')
     
     binary = lief.parse(str(target_file))
     if not binary:
         print('[-] 解析失败，不是有效的 ELF 文件')
-        return False
+        return fail('解析失败，不是有效的 ELF 文件')
     
     try:
         arch_key = detect_target_arch(binary)
     except Exception as e:
         print(str(e))
-        return False
+        return fail(str(e))
     
     arch_spec = ARCH_SPECS[arch_key]
     is64 = arch_spec["bits"] == 64
     arch_name = binary.header.machine_type.name if hasattr(binary.header.machine_type, 'name') else ''
+    status['arch'] = arch_key
+    status['is_64bit'] = bool(is64)
     
     print(f'   目标架构: {arch_key} ({arch_spec["bits"]}-bit)')
     print('   打包模式: 凸包（UPX 风格）')
@@ -1065,12 +1229,16 @@ def pack_with_convex_hull(target_file: Path,
         convex_info = compute_vaddr_convex_hull(binary)
     except Exception as e:
         print(f'[-] {e}')
-        return False
+        return fail(str(e))
     
     print(f'     最小虚拟地址: {hex(convex_info["min_vaddr"])}')
     print(f'     最大虚拟地址: {hex(convex_info["max_vaddr"])}')
     print(f'     凸包大小: {hex(convex_info["size"])} ({convex_info["size"]} 字节)')
     print(f'     包含 PT_LOAD 段数: {convex_info["count"]}')
+    status['convex_min_vaddr'] = int(convex_info['min_vaddr'])
+    status['convex_max_vaddr'] = int(convex_info['max_vaddr'])
+    status['convex_size'] = int(convex_info['size'])
+    status['convex_load_count'] = int(convex_info['count'])
     
     # 构建凸包内容
     print('   构建污染数据...')
@@ -1082,13 +1250,17 @@ def pack_with_convex_hull(target_file: Path,
             )
     except Exception as e:
         print(f'[-] {e}')
-        return False
+        return fail(str(e))
 
     print(f'     凸包内容大小: {len(convex_content)} 字节')
     print(f'     可污染段数: {len(recoverable_infos)}, 受保护段数: {len(protected_infos)}')
+    status['convex_content_size'] = int(len(convex_content))
+    status['recoverable_segments'] = int(len(recoverable_infos))
+    status['protected_segments'] = int(len(protected_infos))
 
     # 记录原始 OEP（用于计算布局重排偏移）
     original_oep_before_layout = int(binary.header.entrypoint)
+    status['original_oep_before_layout'] = int(original_oep_before_layout)
 
     # 构建 Stub
     print('   准备 Stub...')
@@ -1106,29 +1278,34 @@ def pack_with_convex_hull(target_file: Path,
             )
         except Exception as e:
             print(str(e))
-            return False
+            return fail(str(e))
     
     if stub_path is None or not stub_path.exists():
         expected = [arch_spec["stub_name"]] + arch_spec["legacy_stub_names"]
-        print(f'[-] 错误：找不到架构 {arch_key} 对应 stub。候选: {expected}')
-        return False
+        msg = f'错误：找不到架构 {arch_key} 对应 stub。候选: {expected}'
+        print(f'[-] {msg}')
+        return fail(msg)
     
     print(f'   使用 stub: {stub_path.name}')
+    status['stub_path'] = str(stub_path)
     
     # 提取 Stub blob
     print('   注入 Stub...')
     try:
         stub = lief.parse(str(stub_path))
         if not stub:
-            print(f'[-] 无法解析 stub 文件 {stub_path}')
-            return False
+            msg = f'无法解析 stub 文件 {stub_path}'
+            print(f'[-] {msg}')
+            return fail(msg)
         
         stub_blob, stub_entry_offset, stub_min_va = get_stub_blob(stub)
         print(f'     Stub 大小: {len(stub_blob)} 字节')
         print(f'     Stub Entry Offset: {hex(stub_entry_offset)}')
+        status['stub_size'] = int(len(stub_blob))
+        status['stub_entry_offset'] = int(stub_entry_offset)
     except Exception as e:
         print(f'[-] {e}')
-        return False
+        return fail(str(e))
     
     # 创建凸包 ELF
     print('   创建凸包 ELF...')
@@ -1141,21 +1318,27 @@ def pack_with_convex_hull(target_file: Path,
         print(f'     原始 OEP（重排后）: {hex(relocated_oep)}')
         print(f'     布局虚拟地址偏移: {hex(vaddr_shift)}')
         stub_symbol_offsets = get_stub_symbol_offsets(stub, stub_min_va, STUB_PATCH_SYMBOLS)
+        status['relocated_original_oep'] = int(relocated_oep)
+        status['vaddr_shift'] = int(vaddr_shift)
+        status['entry_vaddr'] = int(entry_vaddr)
     except Exception as e:
         print(f'[-] {e}')
-        return False
+        return fail(str(e))
 
     # 写到输出文件（保留原始 PT_DYNAMIC/PT_INTERP 等）
     try:
         new_binary.write(str(output_file))
     except Exception as e:
         print(f'[-] 写输出文件失败: {e}')
-        return False
+        return fail(f'写输出文件失败: {e}')
 
     # 头部重建语义：
     # - 保留不可改 PT_LOAD
     # - 将可恢复 PT_LOAD 失活（PT_NULL）
     # - 运行时由 stub 从 convex 段恢复并 map 回目标虚拟地址
+    nulled = 0
+    changed = 0
+    mode = 'none'
     try:
         nulled, changed, mode = _nullify_recoverable_ptloads(
             output_file=output_file,
@@ -1163,24 +1346,31 @@ def pack_with_convex_hull(target_file: Path,
             recoverable_infos=recoverable_infos,
             vaddr_shift=vaddr_shift,
             strip_plaintext=strip_recoverable_plaintext,
+            prune_bytes=prune_recoverable_bytes,
             prune_pages=prune_recoverable_pages,
         )
         print(f'   Program Header 重写: PT_NULL 化可恢复 PT_LOAD = {nulled}')
         if strip_recoverable_plaintext:
-            if mode == 'prune':
+            if mode == 'byte-prune':
+                print(f'   字节级裁剪: 删除可恢复段精确字节 = {changed} 字节')
+            elif mode == 'prune':
                 print(f'   页级裁剪: 裁剪可恢复段相关页面 = {changed} 字节')
             elif mode == 'wipe':
                 print(f'   明文覆写: 覆写可恢复段原始字节 = {changed} 字节')
     except Exception as e:
         print(f'[-] 重写 Program Header 失败: {e}')
-        return False
+        return fail(f'重写 Program Header 失败: {e}')
+    status['nulled_recoverable_ptloads'] = int(nulled)
+    status['plaintext_changed_bytes'] = int(changed)
+    status['plaintext_handling_mode'] = str(mode)
 
     # 重新解析，定位新增 stub 段的文件偏移
     try:
         out_bin = lief.parse(str(output_file))
         if not out_bin:
-            print('[-] 无法解析输出 ELF')
-            return False
+            msg = '无法解析输出 ELF'
+            print(f'[-] {msg}')
+            return fail(msg)
 
         stub_seg = None
         for seg in out_bin.segments:
@@ -1190,13 +1380,14 @@ def pack_with_convex_hull(target_file: Path,
                 stub_seg = seg
                 break
         if stub_seg is None:
-            print('[-] 无法在输出 ELF 中定位 stub 段')
-            return False
+            msg = '无法在输出 ELF 中定位 stub 段'
+            print(f'[-] {msg}')
+            return fail(msg)
         stub_file_start = int(stub_seg.file_offset)
         convex_va = int(stub_seg.virtual_address)
     except Exception as e:
         print(f'[-] 解析输出布局失败: {e}')
-        return False
+        return fail(f'解析输出布局失败: {e}')
     
     # 打补丁
     print('   打补丁...')
@@ -1209,7 +1400,7 @@ def pack_with_convex_hull(target_file: Path,
         )
     except Exception as e:
         print(f'[-] 打补丁失败: {e}')
-        return False
+        return fail(f'打补丁失败: {e}')
     
     # 保持可执行权限
     try:
@@ -1217,15 +1408,29 @@ def pack_with_convex_hull(target_file: Path,
     except Exception:
         pass
     
-    total_blocks = (header_info['blocks'] +
-                    sum(r['blocks'] for r in recoverable_infos))
+    header_blocks = int(header_info['blocks'])
+    recoverable_blocks = int(sum(r['blocks'] for r in recoverable_infos))
+    total_blocks = header_blocks + recoverable_blocks
+    status['header_blocks'] = header_blocks
+    status['recoverable_blocks'] = recoverable_blocks
+    status['total_blocks'] = total_blocks
+    status['obfuscation_inserted_bytes_header'] = header_blocks * int(insert_size)
+    status['obfuscation_inserted_bytes_recoverable'] = recoverable_blocks * int(insert_size)
+    status['obfuscation_inserted_bytes_excluding_stub'] = total_blocks * int(insert_size)
+    status['convex_va'] = int(convex_va)
+    status['stub_file_start'] = int(stub_file_start)
+    try:
+        status['output_size'] = int(output_file.stat().st_size)
+    except Exception:
+        pass
+
     print(f'[+] 已生成: {output_file}')
     print(f'[+] 凸包模式：stub@{hex(convex_va)}，'
           f'覆盖 {convex_info["count"]} 个原始段')
     print(f'[+] 原始虚拟地址范围: {hex(convex_info["min_vaddr"])} - {hex(convex_info["max_vaddr"])}')
     print(f'[+] 共污染 {total_blocks} 个块，受保护段 {len(protected_infos)} 个\n')
-    
-    return True
+    status['success'] = True
+    return True, status
 
 
 def _output_name(src: Path, suffix: str) -> str:
@@ -1246,6 +1451,27 @@ def _iter_files(input_path: Path, recursive: bool):
     return []
 
 
+def _write_status_json(status_json_path: Path, args, results: list[dict], ok: int, skipped: int, total: int):
+    payload = {
+        'generated_at': datetime.now(timezone.utc).isoformat(),
+        'tool': 'inject_tmp/packer.py',
+        'summary': {
+            'success': int(ok),
+            'skipped': int(skipped),
+            'total': int(total),
+        },
+        'config': {
+            k: v for k, v in vars(args).items()
+            if k != 'status_json'
+        },
+        'results': results,
+    }
+    status_json_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(status_json_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f'[+] 状态报告已写入: {status_json_path}')
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='ELF 打包器：凸包模式（UPX 风格），解决虚拟地址空隙问题')
@@ -1260,6 +1486,8 @@ def main():
     parser.add_argument('--insert-type', choices=['zero', 'nop'], default='nop', help='插入内容类型')
     parser.add_argument('--keep-recoverable-plaintext', action='store_true',
                         help='保留原可恢复段明文字节（默认会裁剪去除，更接近 UPX）')
+    parser.add_argument('--prune-recoverable-bytes', action='store_true',
+                        help='启用非页粒度裁剪（精确删除可恢复段字节，不可裁剪时回退）')
     parser.add_argument('--prune-recoverable-pages', action='store_true',
                         help='启用页级裁剪（按 0x1000 页重排），不可裁剪时回退为明文覆写')
     parser.add_argument('--auto-build-stub', action='store_true', help='自动构建 stub')
@@ -1268,6 +1496,8 @@ def main():
     parser.add_argument('--stub-cc-i386', default=ARCH_SPECS["i386"]["default_cc"], help='i386 stub 编译器')
     parser.add_argument('--stub-cc-arm', default=ARCH_SPECS["arm"]["default_cc"], help='ARM32 stub 编译器')
     parser.add_argument('--stub-cc-aarch64', default=ARCH_SPECS["aarch64"]["default_cc"], help='AArch64 stub 编译器')
+    parser.add_argument('--status-json', default='',
+                        help='将处理状态写入 JSON 文件（包含每个文件的统计信息）')
     parser.add_argument('--no-verify-recovery', action='store_true', help='关闭恢复一致性校验')
     
     args = parser.parse_args()
@@ -1279,17 +1509,19 @@ def main():
         "arm": args.stub_cc_arm,
         "aarch64": args.stub_cc_aarch64,
     }
+    status_path = Path(args.status_json) if args.status_json else None
     
     if not args.input:
         # 默认模式
         target_file = Path(TARGET_FILE)
         output_file = Path(OUTPUT_FILE)
         temp_file = Path(TEMP_FILE)
-        
-        pack_with_convex_hull(
+
+        ok, rec = pack_with_convex_hull(
             target_file, output_file, temp_file,
             args.block_size, args.insert_size, args.insert_type,
             not args.keep_recoverable_plaintext,
+            args.prune_recoverable_bytes,
             args.prune_recoverable_pages,
             args.auto_build_stub, args.rebuild_stub,
             stub_compilers, verify_recovery
@@ -1297,6 +1529,8 @@ def main():
         
         if temp_file.exists():
             temp_file.unlink()
+        if status_path is not None:
+            _write_status_json(status_path, args, [rec], 1 if ok else 0, 0 if ok else 1, 1)
         return
     
     # 处理多个文件
@@ -1318,6 +1552,7 @@ def main():
         return
     
     ok = skipped = 0
+    results: list[dict] = []
     for p in files:
         out_name = _output_name(p, args.suffix)
         out_path = output_dir / out_name
@@ -1325,27 +1560,47 @@ def main():
         if out_path.exists() and not args.overwrite:
             print(f'[跳过] {out_path} 已存在')
             skipped += 1
+            results.append({
+                'input': str(p),
+                'output': str(out_path),
+                'success': False,
+                'skipped': True,
+                'error': '输出文件已存在且未启用 --overwrite',
+            })
             continue
         
         temp_path = output_dir / (out_name + '.tmp.convex.elf')
         
         try:
-            if pack_with_convex_hull(
+            succ, rec = pack_with_convex_hull(
                 p, out_path, temp_path,
                 args.block_size, args.insert_size, args.insert_type,
                 not args.keep_recoverable_plaintext,
+                args.prune_recoverable_bytes,
                 args.prune_recoverable_pages,
                 args.auto_build_stub, args.rebuild_stub,
                 stub_compilers, verify_recovery
-            ):
+            )
+            results.append(rec)
+            if succ:
                 ok += 1
             else:
                 skipped += 1
+        except Exception as e:
+            skipped += 1
+            results.append({
+                'input': str(p),
+                'output': str(out_path),
+                'success': False,
+                'error': f'未捕获异常: {e}',
+            })
         finally:
             if temp_path.exists():
                 temp_path.unlink()
     
     print(f'\n完成: 成功 {ok}, 跳过 {skipped}, 总计 {len(files)}')
+    if status_path is not None:
+        _write_status_json(status_path, args, results, ok, skipped, len(files))
 
 
 if __name__ == '__main__':
