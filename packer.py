@@ -11,6 +11,7 @@ ELF 打包器：凸包模式（UPX 风格）
 
 import argparse
 import json
+import random
 import subprocess
 import shutil
 import struct
@@ -48,6 +49,15 @@ ARCH_I386 = 3
 ARCH_ARM = 40
 ARCH_X86_64 = 62
 ARCH_AARCH64 = 183
+ARCH_MIPS = 8
+ARCH_PPC = 20
+ARCH_SPARC = 2
+ARCH_M68K = 4
+ARCH_SH = 42
+ARCH_OR1K = 92
+ARCH_ARC = 93
+ARCH_XTENSA = 94
+ARCH_NIOS2 = 113
 
 ARCH_SPECS = {
     "x86_64": {
@@ -82,6 +92,118 @@ ARCH_SPECS = {
         "default_cc": "aarch64-linux-gnu-gcc",
         "cflags": [],
     },
+    # inject_tmp 默认 delete.c 目前覆盖:
+    # x86_64/i386/arm/aarch64/mips/ppc/sh/m68k
+    # 其余架构默认走外部/预编译 stub（或 --stub-source 自定义源码）。
+    "mips": {
+        "machine": ARCH_MIPS,
+        "bits": 32,
+        "stub_name": "stub_delete_mips.so",
+        "legacy_stub_names": [],
+        "default_cc": "mips-linux-gnu-gcc",
+        "cflags": [],
+        "auto_build_supported": True,
+    },
+    "ppc": {
+        "machine": ARCH_PPC,
+        "bits": 32,
+        "stub_name": "stub_delete_ppc.so",
+        "legacy_stub_names": ["stub_delete_powerpc.so"],
+        "default_cc": "powerpc-linux-gnu-gcc",
+        "cflags": [],
+        "auto_build_supported": True,
+    },
+    "sparc": {
+        "machine": ARCH_SPARC,
+        "bits": 32,
+        "stub_name": "stub_delete_sparc.so",
+        "legacy_stub_names": [],
+        "default_cc": "sparc-linux-gnu-gcc",
+        "cflags": [],
+        "auto_build_supported": False,
+    },
+    "m68k": {
+        "machine": ARCH_M68K,
+        "bits": 32,
+        "stub_name": "stub_delete_m68k.so",
+        "legacy_stub_names": [],
+        "default_cc": "m68k-linux-gnu-gcc",
+        "cflags": [],
+        "auto_build_supported": True,
+    },
+    "sh": {
+        "machine": ARCH_SH,
+        "bits": 32,
+        "stub_name": "stub_delete_sh.so",
+        "legacy_stub_names": ["stub_delete_sh4.so"],
+        "default_cc": "sh4-linux-gnu-gcc",
+        "cflags": [],
+        "auto_build_supported": True,
+    },
+    "or1k": {
+        "machine": ARCH_OR1K,
+        "bits": 32,
+        "stub_name": "stub_delete_or1k.so",
+        "legacy_stub_names": ["stub_delete_openrisc.so"],
+        "default_cc": "or1k-linux-gnu-gcc",
+        "cflags": [],
+        "auto_build_supported": False,
+    },
+    "arc": {
+        "machine": ARCH_ARC,
+        "bits": 32,
+        "stub_name": "stub_delete_arc.so",
+        "legacy_stub_names": ["stub_delete_arcompact.so"],
+        "default_cc": "arc-linux-gnu-gcc",
+        "cflags": [],
+        "auto_build_supported": False,
+    },
+    "xtensa": {
+        "machine": ARCH_XTENSA,
+        "bits": 32,
+        "stub_name": "stub_delete_xtensa.so",
+        "legacy_stub_names": [],
+        "default_cc": "xtensa-linux-gnu-gcc",
+        "cflags": [],
+        "auto_build_supported": False,
+    },
+    "nios2": {
+        "machine": ARCH_NIOS2,
+        "bits": 32,
+        "stub_name": "stub_delete_nios2.so",
+        "legacy_stub_names": [],
+        "default_cc": "nios2-linux-gnu-gcc",
+        "cflags": [],
+        "auto_build_supported": False,
+    },
+}
+
+SUPPORTED_MACHINE_TO_ARCH = {
+    int(spec["machine"]): key for key, spec in ARCH_SPECS.items()
+}
+
+MACHINE_ALIASES = {
+    "x86_64": ARCH_X86_64,
+    "amd64": ARCH_X86_64,
+    "i386": ARCH_I386,
+    "x86": ARCH_I386,
+    "arm": ARCH_ARM,
+    "arm32": ARCH_ARM,
+    "aarch64": ARCH_AARCH64,
+    "arm64": ARCH_AARCH64,
+    "mips": ARCH_MIPS,
+    "ppc": ARCH_PPC,
+    "powerpc": ARCH_PPC,
+    "sparc": ARCH_SPARC,
+    "m68k": ARCH_M68K,
+    "sh": ARCH_SH,
+    "superh": ARCH_SH,
+    "or1k": ARCH_OR1K,
+    "openrisc": ARCH_OR1K,
+    "arc": ARCH_ARC,
+    "arcompact": ARCH_ARC,
+    "xtensa": ARCH_XTENSA,
+    "nios2": ARCH_NIOS2,
 }
 
 MAGIC_MAP_64 = {
@@ -161,11 +283,33 @@ def is_elf64(binary):
 
 def detect_target_arch(binary) -> str:
     machine = int(binary.header.machine_type)
-    for arch_key, spec in ARCH_SPECS.items():
-        if machine == spec["machine"]:
-            return arch_key
+    arch_key, _ = resolve_arch_from_machine(machine)
+    if arch_key is not None:
+        return arch_key
     name = getattr(binary.header.machine_type, "name", str(binary.header.machine_type))
     raise RuntimeError(f"[-] 暂不支持的 ELF 架构: machine={machine} ({name})")
+
+
+def parse_machine_arg(machine_arg: str) -> int | None:
+    raw = (machine_arg or "").strip()
+    if not raw:
+        return None
+    key = raw.lower().replace("-", "_")
+    if key in MACHINE_ALIASES:
+        return int(MACHINE_ALIASES[key])
+    try:
+        return int(raw, 0)
+    except Exception as e:
+        raise RuntimeError(f"[-] 无法解析 --machine: {machine_arg}") from e
+
+
+def resolve_arch_from_machine(machine: int | None) -> tuple[str | None, dict | None]:
+    if machine is None:
+        return None, None
+    arch_key = SUPPORTED_MACHINE_TO_ARCH.get(int(machine))
+    if arch_key is None:
+        return None, None
+    return arch_key, ARCH_SPECS[arch_key]
 
 
 def seg_has_exec(seg) -> bool:
@@ -248,15 +392,40 @@ def get_stub_symbol_offsets(stub_binary, min_va: int, symbol_names: tuple[str, .
     return offsets
 
 
-def build_delete_stub(base_dir: Path, arch_key: str, compiler: str, force: bool) -> Path:
+def resolve_stub_source(base_dir: Path, arch_key: str, override_source: str = "") -> Path:
+    if override_source:
+        candidate = Path(override_source)
+        if not candidate.is_absolute():
+            candidate = (base_dir / candidate).resolve()
+        if candidate.exists():
+            return candidate
+        raise RuntimeError(f'[-] 指定的 stub 源码不存在: {candidate}')
+
+    candidates = [
+        base_dir / f"stubs/delete_{arch_key}.c",
+        base_dir / f"delete_{arch_key}.c",
+        base_dir / f"delete.{arch_key}.c",
+        base_dir / "delete.c",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise RuntimeError(f'[-] 缺少 stub 源码（已尝试: {[str(x) for x in candidates]}）')
+
+
+def build_delete_stub(base_dir: Path, arch_key: str, compiler: str, force: bool,
+                      source_override: str = "", timeout_sec: int = 120) -> Path:
     spec = ARCH_SPECS[arch_key]
+    if not bool(spec.get("auto_build_supported", True)) and not source_override:
+        raise RuntimeError(
+            f'[-] 架构 {arch_key} 当前不支持基于默认 delete.c 自动构建 stub。'
+            f'请提供 --stub-path，或使用 --stub-source 指向该架构的自定义源码。'
+        )
     stub_path = base_dir / spec["stub_name"]
     if stub_path.exists() and not force:
         return stub_path
 
-    delete_c = base_dir / "delete.c"
-    if not delete_c.exists():
-        raise RuntimeError(f'[-] 缺少 stub 源码: {delete_c}')
+    delete_c = resolve_stub_source(base_dir, arch_key, source_override)
 
     cmd = [
         compiler,
@@ -271,8 +440,28 @@ def build_delete_stub(base_dir: Path, arch_key: str, compiler: str, force: bool)
     ]
     cmd.extend(spec["cflags"])
     cmd.extend(["-o", str(stub_path), str(delete_c)])
+    print(f'    [build] {" ".join(cmd)}')
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=max(1, int(timeout_sec)),
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(f'[-] 构建 stub 失败：未找到编译器 {compiler}') from e
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or "").strip() if isinstance(e.stdout, str) else ""
+        err = (e.stderr or "").strip() if isinstance(e.stderr, str) else ""
+        raise RuntimeError(
+            f'[-] 构建 stub 超时（>{int(timeout_sec)}s）: {" ".join(cmd)}\n'
+            f'    stdout: {out}\n'
+            f'    stderr: {err}\n'
+            f'    建议：检查交叉编译器/工具链，或使用 --stub-path 指定预编译 stub，'
+            f'或通过 --stub-build-timeout 增大超时。'
+        ) from e
     if proc.returncode != 0:
         stderr = proc.stderr.strip()
         stdout = proc.stdout.strip()
@@ -818,8 +1007,8 @@ def _elf_machine_value(binary) -> int:
     try:
         return int(binary.header.machine_type)
     except Exception:
-        name = str(binary.header.machine_type).lower()
-        for key, val in (('x86_64', 62), ('i386', 3), ('aarch64', 183), ('arm', 40)):
+        name = str(binary.header.machine_type).lower().replace('-', '_')
+        for key, val in MACHINE_ALIASES.items():
             if key in name:
                 return val
     return 0
@@ -843,7 +1032,24 @@ _PROTECTED_SECTION_NAMES = frozenset({
 
 
 def is_segment_protectable(binary: lief.ELF.Binary, seg) -> bool:
-    """Return True if the segment must NOT be polluted (contains dynamic linking info)."""
+    """Return True if the segment must NOT be polluted."""
+    # Hard rule: if the first PT_LOAD starts at file offset 0, always keep it.
+    # This avoids destroying ELF header / PHDR area on binaries whose first
+    # load segment covers the file header region.
+    first_load = None
+    for cand in binary.segments:
+        if cand.type == lief.ELF.Segment.TYPE.LOAD:
+            first_load = cand
+            break
+    if first_load is not None and int(first_load.file_offset) == 0:
+        if (
+            int(seg.file_offset) == int(first_load.file_offset)
+            and int(seg.virtual_address) == int(first_load.virtual_address)
+            and int(seg.physical_size) == int(first_load.physical_size)
+        ):
+            return True
+
+    # Existing rule: keep segments that contain dynamic-linking metadata.
     seg_start = seg.virtual_address
     seg_end = seg.virtual_address + max(seg.virtual_size, seg.physical_size)
 
@@ -1171,9 +1377,13 @@ def pack_with_convex_hull(target_file: Path,
                           strip_recoverable_plaintext: bool,
                           prune_recoverable_bytes: bool,
                           prune_recoverable_pages: bool,
+                          machine_override: int | None,
+                          stub_path_override: str,
+                          stub_source_override: str,
                           auto_build_stub: bool,
                           rebuild_stub: bool,
                           stub_compilers: dict[str, str],
+                          stub_build_timeout: int,
                           verify_recovery: bool) -> tuple[bool, dict]:
     """
     使用凸包方式打包 ELF
@@ -1191,6 +1401,10 @@ def pack_with_convex_hull(target_file: Path,
         'strip_recoverable_plaintext': bool(strip_recoverable_plaintext),
         'prune_recoverable_bytes': bool(prune_recoverable_bytes),
         'prune_recoverable_pages': bool(prune_recoverable_pages),
+        'machine_override': machine_override,
+        'stub_path_override': stub_path_override,
+        'stub_source_override': stub_source_override,
+        'stub_build_timeout': int(stub_build_timeout),
         'verify_recovery': bool(verify_recovery),
     }
 
@@ -1205,19 +1419,24 @@ def pack_with_convex_hull(target_file: Path,
         print('[-] 解析失败，不是有效的 ELF 文件')
         return fail('解析失败，不是有效的 ELF 文件')
     
-    try:
-        arch_key = detect_target_arch(binary)
-    except Exception as e:
-        print(str(e))
-        return fail(str(e))
-    
-    arch_spec = ARCH_SPECS[arch_key]
-    is64 = arch_spec["bits"] == 64
-    arch_name = binary.header.machine_type.name if hasattr(binary.header.machine_type, 'name') else ''
-    status['arch'] = arch_key
+    machine = int(machine_override) if machine_override is not None else int(binary.header.machine_type)
+    arch_key, arch_spec = resolve_arch_from_machine(machine)
+    is64 = bool(is_elf64(binary))
+    arch_name = arch_key or (
+        binary.header.machine_type.name if hasattr(binary.header.machine_type, 'name') else f'machine={machine}'
+    )
+    status['machine'] = int(machine)
+    status['arch'] = arch_key if arch_key is not None else f'machine={machine}'
     status['is_64bit'] = bool(is64)
-    
-    print(f'   目标架构: {arch_key} ({arch_spec["bits"]}-bit)')
+
+    if arch_key is not None and arch_spec is not None:
+        print(f'   目标架构: {arch_key} ({arch_spec["bits"]}-bit)')
+    else:
+        print(f'   目标架构: machine={machine} ({64 if is64 else 32}-bit)')
+        if not stub_path_override:
+            msg = f'[-] 暂不支持的 ELF 架构: machine={machine}（请提供 --stub-path）'
+            print(msg)
+            return fail(msg)
     print('   打包模式: 凸包（UPX 风格）')
     
     with open(target_file, "rb") as f:
@@ -1265,26 +1484,46 @@ def pack_with_convex_hull(target_file: Path,
     # 构建 Stub
     print('   准备 Stub...')
     base_dir = Path(__file__).parent
-    stub_path = resolve_existing_stub(base_dir, arch_key)
-    
-    if auto_build_stub or rebuild_stub:
-        try:
-            compiler = stub_compilers.get(arch_key) or arch_spec["default_cc"]
-            stub_path = build_delete_stub(
-                base_dir=base_dir,
-                arch_key=arch_key,
-                compiler=compiler,
-                force=rebuild_stub,
-            )
-        except Exception as e:
-            print(str(e))
-            return fail(str(e))
-    
-    if stub_path is None or not stub_path.exists():
-        expected = [arch_spec["stub_name"]] + arch_spec["legacy_stub_names"]
-        msg = f'错误：找不到架构 {arch_key} 对应 stub。候选: {expected}'
-        print(f'[-] {msg}')
-        return fail(msg)
+    stub_path: Path | None = None
+    if stub_path_override:
+        stub_path = Path(stub_path_override)
+        if not stub_path.is_absolute():
+            stub_path = (base_dir / stub_path).resolve()
+        if not stub_path.exists():
+            msg = f'错误：指定的 --stub-path 不存在: {stub_path}'
+            print(f'[-] {msg}')
+            return fail(msg)
+        if auto_build_stub or rebuild_stub:
+            print('   [notice] 已指定 --stub-path，忽略 --auto-build-stub/--rebuild-stub')
+    else:
+        if arch_key is None or arch_spec is None:
+            msg = '错误：未知架构必须显式提供 --stub-path'
+            print(f'[-] {msg}')
+            return fail(msg)
+        stub_path = resolve_existing_stub(base_dir, arch_key)
+        if auto_build_stub or rebuild_stub:
+            try:
+                compiler = stub_compilers.get(arch_key) or arch_spec["default_cc"]
+                stub_path = build_delete_stub(
+                    base_dir=base_dir,
+                    arch_key=arch_key,
+                    compiler=compiler,
+                    force=rebuild_stub,
+                    source_override=stub_source_override,
+                    timeout_sec=stub_build_timeout,
+                )
+            except Exception as e:
+                print(str(e))
+                return fail(str(e))
+
+        if stub_path is None or not stub_path.exists():
+            expected = [arch_spec["stub_name"]] + arch_spec["legacy_stub_names"]
+            detail = ''
+            if not bool(arch_spec.get("auto_build_supported", True)):
+                detail = '（该架构默认仅支持外部 stub；可用 --stub-path 或 --stub-source）'
+            msg = f'错误：找不到架构 {arch_key} 对应 stub。候选: {expected}{detail}'
+            print(f'[-] {msg}')
+            return fail(msg)
     
     print(f'   使用 stub: {stub_path.name}')
     status['stub_path'] = str(stub_path)
@@ -1479,6 +1718,8 @@ def main():
     parser.add_argument('--input', default='', help='输入文件或目录')
     parser.add_argument('--output-dir', default='', help='输出目录')
     parser.add_argument('--recursive', action='store_true', help='递归处理子目录')
+    parser.add_argument('--num-files', type=int, default=0,
+                        help='当 --input 为目录时，随机处理文件并在成功数量达到该值后停止；<=0 表示处理全部')
     parser.add_argument('--suffix', default='_packed', help='输出文件名后缀')
     parser.add_argument('--overwrite', action='store_true', help='覆盖已存在文件')
     parser.add_argument('--block-size', type=int, default=32, help='原始块大小（字节）')
@@ -1490,12 +1731,27 @@ def main():
                         help='启用非页粒度裁剪（精确删除可恢复段字节，不可裁剪时回退）')
     parser.add_argument('--prune-recoverable-pages', action='store_true',
                         help='启用页级裁剪（按 0x1000 页重排），不可裁剪时回退为明文覆写')
+    parser.add_argument('--machine', default='',
+                        help='覆盖目标 e_machine（如 x86_64/i386/arm/aarch64/mips/ppc/sparc/sh/m68k/or1k/arc/xtensa/nios2，或数值如 62）')
+    parser.add_argument('--stub-path', default='',
+                        help='外部 stub 路径；可用于非内建架构')
+    parser.add_argument('--stub-source', default='',
+                        help='自动构建 stub 时使用的源文件（相对路径相对于 inject_tmp 目录）')
     parser.add_argument('--auto-build-stub', action='store_true', help='自动构建 stub')
     parser.add_argument('--rebuild-stub', action='store_true', help='强制重建 stub')
     parser.add_argument('--stub-cc-x86-64', default=ARCH_SPECS["x86_64"]["default_cc"], help='x86_64 stub 编译器')
     parser.add_argument('--stub-cc-i386', default=ARCH_SPECS["i386"]["default_cc"], help='i386 stub 编译器')
     parser.add_argument('--stub-cc-arm', default=ARCH_SPECS["arm"]["default_cc"], help='ARM32 stub 编译器')
     parser.add_argument('--stub-cc-aarch64', default=ARCH_SPECS["aarch64"]["default_cc"], help='AArch64 stub 编译器')
+    parser.add_argument('--stub-cc-mips', default=ARCH_SPECS["mips"]["default_cc"], help='MIPS stub 编译器')
+    parser.add_argument('--stub-cc-ppc', default=ARCH_SPECS["ppc"]["default_cc"], help='PowerPC stub 编译器')
+    parser.add_argument('--stub-cc-sh', default=ARCH_SPECS["sh"]["default_cc"], help='SuperH stub 编译器')
+    parser.add_argument('--stub-cc-m68k', default=ARCH_SPECS["m68k"]["default_cc"], help='M68K stub 编译器')
+    parser.add_argument('--stub-build-timeout', type=int, default=120,
+                        help='自动构建 stub 的超时时间（秒）')
+    # backward-compatible aliases
+    parser.add_argument('--stub-cc64', default='', help=argparse.SUPPRESS)
+    parser.add_argument('--stub-cc32', default='', help=argparse.SUPPRESS)
     parser.add_argument('--status-json', default='',
                         help='将处理状态写入 JSON 文件（包含每个文件的统计信息）')
     parser.add_argument('--no-verify-recovery', action='store_true', help='关闭恢复一致性校验')
@@ -1503,11 +1759,22 @@ def main():
     args = parser.parse_args()
     
     verify_recovery = not args.no_verify_recovery
+    try:
+        machine_override = parse_machine_arg(args.machine)
+    except Exception as e:
+        print(str(e))
+        return
+    if machine_override is not None and args.machine:
+        print(f'   [config] machine override: {args.machine} -> {machine_override}')
     stub_compilers = {
-        "x86_64": args.stub_cc_x86_64,
-        "i386": args.stub_cc_i386,
-        "arm": args.stub_cc_arm,
-        "aarch64": args.stub_cc_aarch64,
+        "x86_64": args.stub_cc_x86_64 or args.stub_cc64 or ARCH_SPECS["x86_64"]["default_cc"],
+        "i386": args.stub_cc_i386 or args.stub_cc32 or ARCH_SPECS["i386"]["default_cc"],
+        "arm": args.stub_cc_arm or ARCH_SPECS["arm"]["default_cc"],
+        "aarch64": args.stub_cc_aarch64 or ARCH_SPECS["aarch64"]["default_cc"],
+        "mips": args.stub_cc_mips or ARCH_SPECS["mips"]["default_cc"],
+        "ppc": args.stub_cc_ppc or ARCH_SPECS["ppc"]["default_cc"],
+        "sh": args.stub_cc_sh or ARCH_SPECS["sh"]["default_cc"],
+        "m68k": args.stub_cc_m68k or ARCH_SPECS["m68k"]["default_cc"],
     }
     status_path = Path(args.status_json) if args.status_json else None
     
@@ -1523,8 +1790,11 @@ def main():
             not args.keep_recoverable_plaintext,
             args.prune_recoverable_bytes,
             args.prune_recoverable_pages,
+            machine_override,
+            args.stub_path,
+            args.stub_source,
             args.auto_build_stub, args.rebuild_stub,
-            stub_compilers, verify_recovery
+            stub_compilers, args.stub_build_timeout, verify_recovery
         )
         
         if temp_file.exists():
@@ -1533,6 +1803,10 @@ def main():
             _write_status_json(status_path, args, [rec], 1 if ok else 0, 0 if ok else 1, 1)
         return
     
+    if args.num_files < 0:
+        print('[-] Error: --num-files 不能为负数。')
+        return
+
     # 处理多个文件
     input_path = Path(args.input)
     if not input_path.exists():
@@ -1550,10 +1824,20 @@ def main():
     if not files:
         print('[-] 未找到任何文件')
         return
+
+    target_success = args.num_files if input_path.is_dir() and args.num_files > 0 else 0
+    if input_path.is_file() and args.num_files > 0:
+        print('[notice] --num-files 仅在目录输入时生效；当前为单文件输入，已忽略。')
+    if target_success > 0:
+        random.shuffle(files)
+        print(f'[*] 随机处理模式已启用：目标成功数量={target_success}，候选文件={len(files)}')
     
     ok = skipped = 0
     results: list[dict] = []
     for p in files:
+        if target_success > 0 and ok >= target_success:
+            print(f'[*] 已达到目标成功数量 {target_success}，提前停止。')
+            break
         out_name = _output_name(p, args.suffix)
         out_path = output_dir / out_name
         
@@ -1578,8 +1862,11 @@ def main():
                 not args.keep_recoverable_plaintext,
                 args.prune_recoverable_bytes,
                 args.prune_recoverable_pages,
+                machine_override,
+                args.stub_path,
+                args.stub_source,
                 args.auto_build_stub, args.rebuild_stub,
-                stub_compilers, verify_recovery
+                stub_compilers, args.stub_build_timeout, verify_recovery
             )
             results.append(rec)
             if succ:
@@ -1598,9 +1885,12 @@ def main():
             if temp_path.exists():
                 temp_path.unlink()
     
-    print(f'\n完成: 成功 {ok}, 跳过 {skipped}, 总计 {len(files)}')
+    attempted = len(results)
+    if target_success > 0 and ok < target_success:
+        print(f'[!] 候选文件已遍历完，未达到目标成功数量 {target_success}（实际成功 {ok}）')
+    print(f'\n完成: 成功 {ok}, 跳过 {skipped}, 已处理 {attempted}, 候选总数 {len(files)}')
     if status_path is not None:
-        _write_status_json(status_path, args, results, ok, skipped, len(files))
+        _write_status_json(status_path, args, results, ok, skipped, attempted)
 
 
 if __name__ == '__main__':

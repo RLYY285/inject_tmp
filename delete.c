@@ -1,5 +1,5 @@
 // delete.c - 凸包模式（UPX 风格）
-// 支持 x86_64, i386, aarch64, arm
+// 支持 x86_64, i386, aarch64, arm, mips, ppc, sh, m68k
 
 #include <stdint.h>
 
@@ -11,6 +11,14 @@
 #define ARCH_AARCH64 1
 #elif defined(__arm__)
 #define ARCH_ARM 1
+#elif defined(__mips__)
+#define ARCH_MIPS 1
+#elif defined(__powerpc__) && !defined(__powerpc64__)
+#define ARCH_PPC 1
+#elif defined(__sh__)
+#define ARCH_SH 1
+#elif defined(__m68k__)
+#define ARCH_M68K 1
 #else
 #error "Unsupported architecture for delete.c"
 #endif
@@ -169,6 +177,24 @@ __attribute__((section(STUB_DATA_SECTION))) __attribute__((visibility("hidden"))
 volatile uint32_t SAVED_R2 = 0;
 __attribute__((section(STUB_DATA_SECTION))) __attribute__((visibility("hidden"))) __attribute__((aligned(16)))
 static uint8_t STUB_STACK[STUB_STACK_SIZE];
+#elif defined(ARCH_MIPS)
+__attribute__((section(STUB_DATA_SECTION))) __attribute__((visibility("hidden"))) __attribute__((aligned(16)))
+volatile uint32_t SAVED_SP = 0;
+__attribute__((section(STUB_DATA_SECTION))) __attribute__((visibility("hidden"))) __attribute__((aligned(16)))
+volatile uint32_t SAVED_A0 = 0;
+__attribute__((section(STUB_DATA_SECTION))) __attribute__((visibility("hidden"))) __attribute__((aligned(16)))
+volatile uint32_t SAVED_A1 = 0;
+__attribute__((section(STUB_DATA_SECTION))) __attribute__((visibility("hidden"))) __attribute__((aligned(16)))
+volatile uint32_t SAVED_A2 = 0;
+#elif defined(ARCH_PPC)
+__attribute__((section(STUB_DATA_SECTION))) __attribute__((visibility("hidden"))) __attribute__((aligned(16)))
+volatile uint32_t SAVED_R1 = 0;
+__attribute__((section(STUB_DATA_SECTION))) __attribute__((visibility("hidden"))) __attribute__((aligned(16)))
+volatile uint32_t SAVED_R3 = 0;
+__attribute__((section(STUB_DATA_SECTION))) __attribute__((visibility("hidden"))) __attribute__((aligned(16)))
+volatile uint32_t SAVED_R4 = 0;
+__attribute__((section(STUB_DATA_SECTION))) __attribute__((visibility("hidden"))) __attribute__((aligned(16)))
+volatile uint32_t SAVED_R5 = 0;
 #endif
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -183,6 +209,9 @@ static uint8_t STUB_STACK[STUB_STACK_SIZE];
 #define SYS_MPROTECT 226
 #define SYS_EXIT     93
 #define SYS_MMAP     222
+#elif defined(ARCH_MIPS)
+#define SYS_MPROTECT 4125
+#define SYS_EXIT     4001
 #else
 #define SYS_MPROTECT 125
 #define SYS_EXIT     1
@@ -228,15 +257,21 @@ static inline long my_syscall3(long n, long a1, long a2, long a3) {
 }
 static inline long my_syscall6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
     long ret;
-    register long ebp_save __asm__("ebp") = a6;
     __asm__ volatile (
+        "push %%ebx\n\t"
         "push %%ebp\n\t"
+        "movl %2, %%ebx\n\t"
+        "movl %3, %%ecx\n\t"
+        "movl %4, %%edx\n\t"
+        "movl %5, %%esi\n\t"
+        "movl %6, %%edi\n\t"
         "movl %7, %%ebp\n\t"
         "int $0x80\n\t"
         "pop %%ebp\n\t"
+        "pop %%ebx\n\t"
         : "=a"(ret)
-        : "a"(n), "b"(a1), "c"(a2), "d"(a3), "S"(a4), "D"(a5), "m"(ebp_save)
-        : "memory");
+        : "a"(n), "g"(a1), "g"(a2), "g"(a3), "g"(a4), "g"(a5), "g"(a6)
+        : "ecx", "edx", "esi", "edi", "memory", "cc");
     return ret;
 }
 #elif defined(ARCH_AARCH64)
@@ -298,22 +333,126 @@ static inline long my_syscall3(long n, long a1, long a2, long a3) {
     return ret;
 }
 static inline long my_syscall6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
-    long ret;
+    register long r0 __asm__("r0") = a1;
+    register long r1 __asm__("r1") = a2;
+    register long r2 __asm__("r2") = a3;
+    register long r3 __asm__("r3") = a4;
+    register long r4 __asm__("r4") = a5;
+    register long r5 __asm__("r5") = a6;
+    register long r7 __asm__("r7") = n;
     __asm__ volatile (
-        "mov r7, %1\n\t"
-        "mov r0, %2\n\t"
-        "mov r1, %3\n\t"
-        "mov r2, %4\n\t"
-        "mov r3, %5\n\t"
-        "mov r4, %6\n\t"
-        "mov r5, %7\n\t"
         "svc 0\n\t"
-        "mov %0, r0\n\t"
-        : "=r"(ret)
-        : "r"(n), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6)
-        : "r0", "r1", "r2", "r3", "r4", "r5", "r7", "memory", "cc", "lr"
+        : "+r"(r0)
+        : "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5), "r"(r7)
+        : "memory", "cc", "lr"
     );
-    return ret;
+    return r0;
+}
+#elif defined(ARCH_MIPS)
+static inline long my_syscall1(long n, long a1) {
+    register long v0 __asm__("$2") = n;
+    register long a0 __asm__("$4") = a1;
+    register long a3 __asm__("$7");
+    __asm__ volatile (
+        "syscall"
+        : "+r"(v0), "+r"(a3)
+        : "r"(a0)
+        : "memory"
+    );
+    if (a3) return -1;
+    return v0;
+}
+static inline long my_syscall3(long n, long a1, long a2, long a3v) {
+    register long v0 __asm__("$2") = n;
+    register long a0 __asm__("$4") = a1;
+    register long a1r __asm__("$5") = a2;
+    register long a2r __asm__("$6") = a3v;
+    register long a3 __asm__("$7");
+    __asm__ volatile (
+        "syscall"
+        : "+r"(v0), "+r"(a3)
+        : "r"(a0), "r"(a1r), "r"(a2r)
+        : "memory"
+    );
+    if (a3) return -1;
+    return v0;
+}
+#elif defined(ARCH_PPC)
+static inline long my_syscall1(long n, long a1) {
+    register long r0 __asm__("r0") = n;
+    register long r3 __asm__("r3") = a1;
+    __asm__ volatile (
+        "sc"
+        : "+r"(r0), "+r"(r3)
+        :
+        : "memory", "cc"
+    );
+    return r3;
+}
+static inline long my_syscall3(long n, long a1, long a2, long a3v) {
+    register long r0 __asm__("r0") = n;
+    register long r3 __asm__("r3") = a1;
+    register long r4 __asm__("r4") = a2;
+    register long r5 __asm__("r5") = a3v;
+    __asm__ volatile (
+        "sc"
+        : "+r"(r0), "+r"(r3)
+        : "r"(r4), "r"(r5)
+        : "memory", "cc"
+    );
+    return r3;
+}
+#elif defined(ARCH_SH)
+static inline long my_syscall1(long n, long a1) {
+    register long r3 __asm__("r3") = n;
+    register long r4 __asm__("r4") = a1;
+    register long r0 __asm__("r0");
+    __asm__ volatile (
+        "trapa #0x17"
+        : "=r"(r0)
+        : "r"(r3), "r"(r4)
+        : "memory"
+    );
+    return r0;
+}
+static inline long my_syscall3(long n, long a1, long a2, long a3v) {
+    register long r3 __asm__("r3") = n;
+    register long r4 __asm__("r4") = a1;
+    register long r5 __asm__("r5") = a2;
+    register long r6 __asm__("r6") = a3v;
+    register long r0 __asm__("r0");
+    __asm__ volatile (
+        "trapa #0x17"
+        : "=r"(r0)
+        : "r"(r3), "r"(r4), "r"(r5), "r"(r6)
+        : "memory"
+    );
+    return r0;
+}
+#elif defined(ARCH_M68K)
+static inline long my_syscall1(long n, long a1) {
+    register long d0 __asm__("d0") = n;
+    register long d1 __asm__("d1") = a1;
+    __asm__ volatile (
+        "trap #0"
+        : "+r"(d0)
+        : "r"(d1)
+        : "memory"
+    );
+    return d0;
+}
+static inline long my_syscall3(long n, long a1, long a2, long a3v) {
+    register long d0 __asm__("d0") = n;
+    register long d1 __asm__("d1") = a1;
+    register long d2 __asm__("d2") = a2;
+    register long d3 __asm__("d3") = a3v;
+    __asm__ volatile (
+        "trap #0"
+        : "+r"(d0)
+        : "r"(d1), "r"(d2), "r"(d3)
+        : "memory"
+    );
+    return d0;
 }
 #endif
 
@@ -347,6 +486,7 @@ static inline void fail_exit(int code) {
     for (;;) { }
 }
 
+#if defined(ARCH_X64) || defined(ARCH_X86) || defined(ARCH_AARCH64) || defined(ARCH_ARM)
 /*
  * my_mmap: wrap mmap(2).
  *   prot  = PROT_RWX = 7
@@ -382,6 +522,18 @@ static inline void map_fixed(uaddr_t target_addr, uaddr_t size) {
                           7, 0x32 /*MAP_FIXED|MAP_PRIVATE|MAP_ANON*/);
     if (mmap_failed(ret) || ret != aligned_addr) fail_exit(3);
 }
+#else
+/* Fallback for MIPS/PPC/SH/M68K: rewrite bytes in existing mapped regions. */
+static inline int make_writable(uaddr_t target_addr, uaddr_t size) {
+    uaddr_t aligned_addr = target_addr & ~(uaddr_t)0xfff;
+    uaddr_t end = (target_addr + size + 0xfff) & ~(uaddr_t)0xfff;
+    uaddr_t aligned_size = end - aligned_addr;
+    long rc;
+    if (size == 0) return 0;
+    rc = my_syscall3(SYS_MPROTECT, aligned_addr, aligned_size, 7);
+    return rc < 0 ? -1 : 0;
+}
+#endif
 
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -937,6 +1089,393 @@ __attribute__((naked)) void _start(void) {
 
         "bl stub_main\n\t"
         "udf #0\n\t"
+    );
+}
+
+#elif defined(ARCH_SH)
+
+static __attribute__((noinline)) void stub_main(uint32_t saved_sp, uint32_t saved_r4,
+                                                uint32_t saved_r5, uint32_t saved_r6) {
+    uint32_t runtime_addr_of_voffset = (uint32_t)(uintptr_t)&STUB_VOFFSET;
+    uint32_t load_base = runtime_addr_of_voffset - STUB_VOFFSET;
+    uint32_t convex_base = load_base + CONVEX_MIN_VADDR;
+    uint32_t new_oep = load_base + OEP_ADDR;
+    uint32_t count = REGION_COUNT;
+    uint32_t prot_count = PROTECTED_COUNT;
+    uint32_t i;
+    uint32_t dummy;
+    int rc;
+
+    if (count > STUB_MAX_REGIONS) count = STUB_MAX_REGIONS;
+    if (prot_count > STUB_MAX_REGIONS) prot_count = STUB_MAX_REGIONS;
+
+    /* Phase 1: recover polluted PT_LOAD regions */
+    for (i = 0; i < count; i++) {
+        uint32_t region_vaddr  = load_base + REGION_ADDRS[i];
+        uint32_t region_size   = REGION_SIZES[i];
+        uint32_t retain        = REGION_RETAINS[i];
+        uint32_t del           = REGION_DELETES[i];
+        uint32_t blocks        = REGION_BLOCKS[i];
+        uint32_t src           = convex_base + REGION_OFFSETS[i];
+        uint32_t polluted_size = region_size + blocks * del;
+
+        if (!region_size || !retain) continue;
+        if (make_writable(region_vaddr, region_size) != 0) fail_exit(1);
+
+        rc = compact_in_place(
+            (uint8_t *)src, (uint8_t *)region_vaddr,
+            polluted_size, retain, del, blocks,
+            (uaddr_t)-1, (uaddr_t *)&dummy
+        );
+        if (rc != 0) fail_exit(1);
+    }
+
+    /* Phase 2: copy protected PT_LOAD regions */
+    for (i = 0; i < prot_count; i++) {
+        uint32_t vaddr = load_base + PROTECTED_ADDRS[i];
+        uint32_t size  = PROTECTED_SIZES[i];
+        uint32_t src   = convex_base + PROTECTED_OFFSETS[i];
+
+        if (!size) continue;
+        if (make_writable(vaddr, size) != 0) fail_exit(1);
+        memcpy_safe((uint8_t *)vaddr, (uint8_t *)src, size);
+    }
+
+    /* Phase 3: recover ELF header */
+    if (HEADER_SIZE && HEADER_RETAIN) {
+        uint32_t hdr_dst      = load_base + HEADER_VADDR;
+        uint32_t hdr_src      = convex_base + HEADER_OFFSET;
+        uint32_t hdr_polluted = HEADER_SIZE + HEADER_BLOCKS * HEADER_DELETE;
+        if (make_writable(hdr_dst, HEADER_SIZE) != 0) fail_exit(1);
+        rc = compact_in_place(
+            (uint8_t *)hdr_src, (uint8_t *)hdr_dst,
+            hdr_polluted, HEADER_RETAIN, HEADER_DELETE, HEADER_BLOCKS,
+            (uaddr_t)-1, (uaddr_t *)&dummy
+        );
+        if (rc != 0) fail_exit(1);
+    }
+
+    /* Phase 4: jump to OEP */
+    __asm__ volatile (
+        "mov %0, r15\n\t"
+        "mov %1, r4\n\t"
+        "mov %2, r5\n\t"
+        "mov %3, r6\n\t"
+        "jmp @%4\n\t"
+        "nop\n\t"
+        :
+        : "r"(saved_sp), "r"(saved_r4), "r"(saved_r5), "r"(saved_r6), "r"(new_oep)
+        : "r4", "r5", "r6", "memory"
+    );
+
+    fail_exit(0);
+}
+
+__attribute__((naked)) void _start(void) {
+    __asm__ volatile (
+        "mov r15, r0\n\t"
+        "mov r4, r1\n\t"
+        "mov r5, r2\n\t"
+        "mov r6, r3\n\t"
+        "mov r0, r4\n\t"
+        "mov r1, r5\n\t"
+        "mov r2, r6\n\t"
+        "mov r3, r7\n\t"
+        "mov.l 1f, r0\n\t"
+        "jsr @r0\n\t"
+        "nop\n\t"
+        "2: bra 2b\n\t"
+        "nop\n\t"
+        ".align 2\n\t"
+        "1: .long stub_main\n\t"
+    );
+}
+
+#elif defined(ARCH_M68K)
+
+static __attribute__((noinline)) void stub_main(uint32_t saved_sp, uint32_t saved_d0,
+                                                uint32_t saved_d1, uint32_t saved_d2) {
+    uint32_t runtime_addr_of_voffset = (uint32_t)(uintptr_t)&STUB_VOFFSET;
+    uint32_t load_base = runtime_addr_of_voffset - STUB_VOFFSET;
+    uint32_t convex_base = load_base + CONVEX_MIN_VADDR;
+    uint32_t new_oep = load_base + OEP_ADDR;
+    uint32_t count = REGION_COUNT;
+    uint32_t prot_count = PROTECTED_COUNT;
+    uint32_t i;
+    uint32_t dummy;
+    int rc;
+
+    if (count > STUB_MAX_REGIONS) count = STUB_MAX_REGIONS;
+    if (prot_count > STUB_MAX_REGIONS) prot_count = STUB_MAX_REGIONS;
+
+    /* Phase 1: recover polluted PT_LOAD regions */
+    for (i = 0; i < count; i++) {
+        uint32_t region_vaddr  = load_base + REGION_ADDRS[i];
+        uint32_t region_size   = REGION_SIZES[i];
+        uint32_t retain        = REGION_RETAINS[i];
+        uint32_t del           = REGION_DELETES[i];
+        uint32_t blocks        = REGION_BLOCKS[i];
+        uint32_t src           = convex_base + REGION_OFFSETS[i];
+        uint32_t polluted_size = region_size + blocks * del;
+
+        if (!region_size || !retain) continue;
+        if (make_writable(region_vaddr, region_size) != 0) fail_exit(1);
+
+        rc = compact_in_place(
+            (uint8_t *)src, (uint8_t *)region_vaddr,
+            polluted_size, retain, del, blocks,
+            (uaddr_t)-1, (uaddr_t *)&dummy
+        );
+        if (rc != 0) fail_exit(1);
+    }
+
+    /* Phase 2: copy protected PT_LOAD regions */
+    for (i = 0; i < prot_count; i++) {
+        uint32_t vaddr = load_base + PROTECTED_ADDRS[i];
+        uint32_t size  = PROTECTED_SIZES[i];
+        uint32_t src   = convex_base + PROTECTED_OFFSETS[i];
+
+        if (!size) continue;
+        if (make_writable(vaddr, size) != 0) fail_exit(1);
+        memcpy_safe((uint8_t *)vaddr, (uint8_t *)src, size);
+    }
+
+    /* Phase 3: recover ELF header */
+    if (HEADER_SIZE && HEADER_RETAIN) {
+        uint32_t hdr_dst      = load_base + HEADER_VADDR;
+        uint32_t hdr_src      = convex_base + HEADER_OFFSET;
+        uint32_t hdr_polluted = HEADER_SIZE + HEADER_BLOCKS * HEADER_DELETE;
+        if (make_writable(hdr_dst, HEADER_SIZE) != 0) fail_exit(1);
+        rc = compact_in_place(
+            (uint8_t *)hdr_src, (uint8_t *)hdr_dst,
+            hdr_polluted, HEADER_RETAIN, HEADER_DELETE, HEADER_BLOCKS,
+            (uaddr_t)-1, (uaddr_t *)&dummy
+        );
+        if (rc != 0) fail_exit(1);
+    }
+
+    /* Phase 4: jump to OEP */
+    __asm__ volatile (
+        "move.l %0, %%sp\n\t"
+        "move.l %1, %%d0\n\t"
+        "move.l %2, %%d1\n\t"
+        "move.l %3, %%d2\n\t"
+        "move.l %4, %%a0\n\t"
+        "jmp (%%a0)\n\t"
+        :
+        : "r"(saved_sp), "r"(saved_d0), "r"(saved_d1), "r"(saved_d2), "r"(new_oep)
+        : "d0", "d1", "d2", "a0", "memory"
+    );
+
+    fail_exit(0);
+}
+
+__attribute__((naked)) void _start(void) {
+    __asm__ volatile (
+        "move.l %sp, %d3\n\t"
+        "move.l %d0, %d4\n\t"
+        "move.l %d1, %d5\n\t"
+        "move.l %d2, %d6\n\t"
+        "move.l %d6, -(%sp)\n\t"
+        "move.l %d5, -(%sp)\n\t"
+        "move.l %d4, -(%sp)\n\t"
+        "move.l %d3, -(%sp)\n\t"
+        "jsr stub_main\n\t"
+        "1: bra 1b\n\t"
+    );
+}
+
+#elif defined(ARCH_MIPS)
+
+static __attribute__((noinline)) void stub_main(uint32_t saved_sp, uint32_t saved_a0,
+                                                uint32_t saved_a1, uint32_t saved_a2) {
+    uint32_t runtime_addr_of_voffset = (uint32_t)(uintptr_t)&STUB_VOFFSET;
+    uint32_t load_base = runtime_addr_of_voffset - STUB_VOFFSET;
+    uint32_t convex_base = load_base + CONVEX_MIN_VADDR;
+    uint32_t new_oep = load_base + OEP_ADDR;
+    uint32_t count = REGION_COUNT;
+    uint32_t prot_count = PROTECTED_COUNT;
+    uint32_t i;
+    uint32_t dummy;
+    int rc;
+
+    if (count > STUB_MAX_REGIONS) count = STUB_MAX_REGIONS;
+    if (prot_count > STUB_MAX_REGIONS) prot_count = STUB_MAX_REGIONS;
+
+    /* Phase 1: recover polluted PT_LOAD regions */
+    for (i = 0; i < count; i++) {
+        uint32_t region_vaddr  = load_base + REGION_ADDRS[i];
+        uint32_t region_size   = REGION_SIZES[i];
+        uint32_t retain        = REGION_RETAINS[i];
+        uint32_t del           = REGION_DELETES[i];
+        uint32_t blocks        = REGION_BLOCKS[i];
+        uint32_t src           = convex_base + REGION_OFFSETS[i];
+        uint32_t polluted_size = region_size + blocks * del;
+
+        if (!region_size || !retain) continue;
+        if (make_writable(region_vaddr, region_size) != 0) fail_exit(1);
+
+        rc = compact_in_place(
+            (uint8_t *)src, (uint8_t *)region_vaddr,
+            polluted_size, retain, del, blocks,
+            (uaddr_t)-1, (uaddr_t *)&dummy
+        );
+        if (rc != 0) fail_exit(1);
+    }
+
+    /* Phase 2: copy protected PT_LOAD regions */
+    for (i = 0; i < prot_count; i++) {
+        uint32_t vaddr = load_base + PROTECTED_ADDRS[i];
+        uint32_t size  = PROTECTED_SIZES[i];
+        uint32_t src   = convex_base + PROTECTED_OFFSETS[i];
+
+        if (!size) continue;
+        if (make_writable(vaddr, size) != 0) fail_exit(1);
+        memcpy_safe((uint8_t *)vaddr, (uint8_t *)src, size);
+    }
+
+    /* Phase 3: recover ELF header */
+    if (HEADER_SIZE && HEADER_RETAIN) {
+        uint32_t hdr_dst      = load_base + HEADER_VADDR;
+        uint32_t hdr_src      = convex_base + HEADER_OFFSET;
+        uint32_t hdr_polluted = HEADER_SIZE + HEADER_BLOCKS * HEADER_DELETE;
+        if (make_writable(hdr_dst, HEADER_SIZE) != 0) fail_exit(1);
+        rc = compact_in_place(
+            (uint8_t *)hdr_src, (uint8_t *)hdr_dst,
+            hdr_polluted, HEADER_RETAIN, HEADER_DELETE, HEADER_BLOCKS,
+            (uaddr_t)-1, (uaddr_t *)&dummy
+        );
+        if (rc != 0) fail_exit(1);
+    }
+
+    /* Phase 4: jump to OEP */
+    __asm__ volatile (
+        "move $sp, %0\n\t"
+        "move $4, %1\n\t"
+        "move $5, %2\n\t"
+        "move $6, %3\n\t"
+        "jr %4\n\t"
+        "nop\n\t"
+        :
+        : "r"(saved_sp), "r"(saved_a0), "r"(saved_a1), "r"(saved_a2), "r"(new_oep)
+        : "$4", "$5", "$6", "memory"
+    );
+
+    fail_exit(0);
+}
+
+__attribute__((naked)) void _start(void) {
+    __asm__ volatile (
+        "move $8, $sp\n\t"
+        "move $9, $4\n\t"
+        "move $10, $5\n\t"
+        "move $11, $6\n\t"
+        "move $4, $8\n\t"
+        "move $5, $9\n\t"
+        "move $6, $10\n\t"
+        "move $7, $11\n\t"
+        "jal stub_main\n\t"
+        "nop\n\t"
+        "break 0\n\t"
+    );
+}
+
+#elif defined(ARCH_PPC)
+
+static __attribute__((noinline)) void stub_main(uint32_t saved_r1, uint32_t saved_r3,
+                                                uint32_t saved_r4, uint32_t saved_r5) {
+    uint32_t runtime_addr_of_voffset = (uint32_t)(uintptr_t)&STUB_VOFFSET;
+    uint32_t load_base = runtime_addr_of_voffset - STUB_VOFFSET;
+    uint32_t convex_base = load_base + CONVEX_MIN_VADDR;
+    uint32_t new_oep = load_base + OEP_ADDR;
+    uint32_t count = REGION_COUNT;
+    uint32_t prot_count = PROTECTED_COUNT;
+    uint32_t i;
+    uint32_t dummy;
+    int rc;
+
+    SAVED_R1 = saved_r1;
+    SAVED_R3 = saved_r3;
+    SAVED_R4 = saved_r4;
+    SAVED_R5 = saved_r5;
+
+    if (count > STUB_MAX_REGIONS) count = STUB_MAX_REGIONS;
+    if (prot_count > STUB_MAX_REGIONS) prot_count = STUB_MAX_REGIONS;
+
+    /* Phase 1: recover polluted PT_LOAD regions */
+    for (i = 0; i < count; i++) {
+        uint32_t region_vaddr  = load_base + REGION_ADDRS[i];
+        uint32_t region_size   = REGION_SIZES[i];
+        uint32_t retain        = REGION_RETAINS[i];
+        uint32_t del           = REGION_DELETES[i];
+        uint32_t blocks        = REGION_BLOCKS[i];
+        uint32_t src           = convex_base + REGION_OFFSETS[i];
+        uint32_t polluted_size = region_size + blocks * del;
+
+        if (!region_size || !retain) continue;
+        if (make_writable(region_vaddr, region_size) != 0) fail_exit(1);
+
+        rc = compact_in_place(
+            (uint8_t *)src, (uint8_t *)region_vaddr,
+            polluted_size, retain, del, blocks,
+            (uaddr_t)-1, (uaddr_t *)&dummy
+        );
+        if (rc != 0) fail_exit(1);
+    }
+
+    /* Phase 2: copy protected PT_LOAD regions */
+    for (i = 0; i < prot_count; i++) {
+        uint32_t vaddr = load_base + PROTECTED_ADDRS[i];
+        uint32_t size  = PROTECTED_SIZES[i];
+        uint32_t src   = convex_base + PROTECTED_OFFSETS[i];
+
+        if (!size) continue;
+        if (make_writable(vaddr, size) != 0) fail_exit(1);
+        memcpy_safe((uint8_t *)vaddr, (uint8_t *)src, size);
+    }
+
+    /* Phase 3: recover ELF header */
+    if (HEADER_SIZE && HEADER_RETAIN) {
+        uint32_t hdr_dst      = load_base + HEADER_VADDR;
+        uint32_t hdr_src      = convex_base + HEADER_OFFSET;
+        uint32_t hdr_polluted = HEADER_SIZE + HEADER_BLOCKS * HEADER_DELETE;
+        if (make_writable(hdr_dst, HEADER_SIZE) != 0) fail_exit(1);
+        rc = compact_in_place(
+            (uint8_t *)hdr_src, (uint8_t *)hdr_dst,
+            hdr_polluted, HEADER_RETAIN, HEADER_DELETE, HEADER_BLOCKS,
+            (uaddr_t)-1, (uaddr_t *)&dummy
+        );
+        if (rc != 0) fail_exit(1);
+    }
+
+    /* Phase 4: jump to OEP */
+    __asm__ volatile (
+        "mr 1, %0\n\t"
+        "mr 3, %1\n\t"
+        "mr 4, %2\n\t"
+        "mr 5, %3\n\t"
+        "mtctr %4\n\t"
+        "bctr\n\t"
+        :
+        : "r"(SAVED_R1), "r"(SAVED_R3), "r"(SAVED_R4), "r"(SAVED_R5), "r"(new_oep)
+        : "r1", "r3", "r4", "r5", "ctr", "memory"
+    );
+
+    fail_exit(0);
+}
+
+__attribute__((naked)) void _start(void) {
+    __asm__ volatile (
+        "mr 8, 1\n\t"
+        "mr 9, 3\n\t"
+        "mr 10, 4\n\t"
+        "mr 11, 5\n\t"
+        "mr 3, 8\n\t"
+        "mr 4, 9\n\t"
+        "mr 5, 10\n\t"
+        "mr 6, 11\n\t"
+        "bl stub_main\n\t"
+        "trap\n\t"
     );
 }
 
