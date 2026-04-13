@@ -1384,7 +1384,8 @@ def pack_with_convex_hull(target_file: Path,
                           rebuild_stub: bool,
                           stub_compilers: dict[str, str],
                           stub_build_timeout: int,
-                          verify_recovery: bool) -> tuple[bool, dict]:
+                          verify_recovery: bool,
+                          skip_zero_recoverable: bool = False) -> tuple[bool, dict]:
     """
     使用凸包方式打包 ELF
     """
@@ -1476,6 +1477,13 @@ def pack_with_convex_hull(target_file: Path,
     status['convex_content_size'] = int(len(convex_content))
     status['recoverable_segments'] = int(len(recoverable_infos))
     status['protected_segments'] = int(len(protected_infos))
+
+    if skip_zero_recoverable and len(recoverable_infos) == 0:
+        msg = '可污染段数为 0，已跳过（--skip-zero-recoverable）'
+        print(f'   [跳过] {msg}')
+        status['skipped'] = True
+        status['error'] = msg
+        return False, status
 
     # 记录原始 OEP（用于计算布局重排偏移）
     original_oep_before_layout = int(binary.header.entrypoint)
@@ -1755,6 +1763,8 @@ def main():
     parser.add_argument('--status-json', default='',
                         help='将处理状态写入 JSON 文件（包含每个文件的统计信息）')
     parser.add_argument('--no-verify-recovery', action='store_true', help='关闭恢复一致性校验')
+    parser.add_argument('--skip-zero-recoverable', action='store_true',
+                        help='跳过可污染段数量为 0 的文件')
     
     args = parser.parse_args()
     
@@ -1866,7 +1876,8 @@ def main():
                 args.stub_path,
                 args.stub_source,
                 args.auto_build_stub, args.rebuild_stub,
-                stub_compilers, args.stub_build_timeout, verify_recovery
+                stub_compilers, args.stub_build_timeout, verify_recovery,
+                args.skip_zero_recoverable
             )
             results.append(rec)
             if succ:
