@@ -354,6 +354,64 @@ def nop_bytes(arch: str, count: int) -> bytes:
     return b'\x00' * count
 
 
+# ── Junk (anti-analysis) instruction sequences for x86-64 ─────────────────
+# Five sequences that are safe to inject (net-effect = identity or dead code):
+#  1. Register juggling  : push/xchg/pop (net effect = identity)
+#  2. Self-cancelling arithmetic: add/ror/rol/sub
+#  3. FPU no-op round-trip: fninit/fldpi/fldz/fcompp/fnop
+#  4. Fake stack frame  : sub/lea/mov/add
+#  5. Opaque predicate + anti-disassembly: test/js/db 0xE9
+#
+# All sequences are NOP-padded to a uniform size so the stub can use a single
+# fixed REGION_DELETES value per region.
+_JUNK_SEQ_X86_64_RAW: tuple = (
+    # 1. push rax; push rbx; xchg rax,rbx; nop; xchg rbx,rax; pop rbx; pop rax
+    b'\x50\x53\x48\x93\x90\x48\x93\x5b\x58',
+    # 2. add rax,0x1234; ror rax,13; rol rax,13; sub rax,0x1234
+    (b'\x48\x05\x34\x12\x00\x00'
+     b'\x48\xc1\xc8\x0d'
+     b'\x48\xc1\xc0\x0d'
+     b'\x48\x2d\x34\x12\x00\x00'),
+    # 3. fninit; fldpi; fldz; fcompp; fnop
+    b'\xdb\xe3\xd9\xeb\xd9\xee\xde\xd9\xd9\xd0',
+    # 4. sub rsp,32; lea rdi,[rsp+16]; mov qword [rdi],0; add rsp,32
+    (b'\x48\x83\xec\x20'
+     b'\x48\x8d\x7c\x24\x10'
+     b'\x48\xc7\x07\x00\x00\x00\x00'
+     b'\x48\x83\xc4\x20'),
+    # 5. test rax,rax; js $+3 (skip 1 byte); db 0xE9 (anti-disassembly stub)
+    b'\x48\x85\xc0\x78\x01\xe9',
+)
+
+_JUNK_INSERT_SIZE_X86_64: int = max(len(s) for s in _JUNK_SEQ_X86_64_RAW)  # 20 bytes
+
+# Pad each sequence with NOPs to the uniform insert size.
+_JUNK_SEQUENCES_X86_64: tuple = tuple(
+    s + b'\x90' * (_JUNK_INSERT_SIZE_X86_64 - len(s))
+    for s in _JUNK_SEQ_X86_64_RAW
+)
+
+_JUNK_SEQ_COUNT: int = len(_JUNK_SEQUENCES_X86_64)
+
+
+def _is_x86_64(arch: str) -> bool:
+    a = arch.lower()
+    return 'x86_64' in a or 'x86-64' in a or 'amd64' in a
+
+
+def get_junk_insert_size(arch: str) -> int:
+    """Return the fixed insert_size (bytes) used per block in junk mode."""
+    return _JUNK_INSERT_SIZE_X86_64
+
+
+def junk_fill_bytes(arch: str, seq_index: int) -> bytes:
+    """Return the (NOP-padded) junk byte sequence for arch at position seq_index (cyclic)."""
+    if _is_x86_64(arch):
+        return _JUNK_SEQUENCES_X86_64[seq_index % _JUNK_SEQ_COUNT]
+    # For non-x86-64 architectures fall back to NOP padding.
+    return nop_bytes(arch, _JUNK_INSERT_SIZE_X86_64)
+
+
 def align_up(value: int, alignment: int) -> int:
     if alignment <= 1:
         return value
@@ -487,12 +545,28 @@ def resolve_existing_stub(base_dir: Path, arch_key: str) -> Path | None:
 
 
 def build_polluted_text(old_text: bytes, block_size: int, insert_size: int, insert_type: str, arch_name: str):
+    if insert_type == 'junk':
+        # Cycle through the five junk sequences; insert_size is already the
+        # junk-determined size (get_junk_insert_size), passed in by the caller.
+        new_content = bytearray()
+        pos = 0
+        insert_count = 0
+        seq_idx = 0
+        old_size = len(old_text)
+        while pos + block_size <= old_size:
+            new_content.extend(old_text[pos:pos + block_size])
+            new_content.extend(junk_fill_bytes(arch_name, seq_idx))
+            seq_idx += 1
+            insert_count += 1
+            pos += block_size
+        if pos < old_size:
+            new_content.extend(old_text[pos:])
+        return bytes(new_content), insert_count
+
     if insert_type == 'zero':
         fill = b'\x00' * insert_size
     elif insert_type == 'nop':
         fill = nop_bytes(arch_name, insert_size)
-    elif insert_type == 'junk':
-        fill = os.urandom(insert_size)
     else:
         raise ValueError("insert_type 必须是 zero、nop 或 junk")
 
@@ -1594,6 +1668,13 @@ def pack_with_convex_hull(target_file: Path,
     status['arch'] = arch_key if arch_key is not None else f'machine={machine}'
     status['is_64bit'] = bool(is64)
 
+    # In junk mode the insert size is determined by the junk sequences; override
+    # whatever the caller passed so that all downstream code is consistent.
+    if insert_type == 'junk':
+        insert_size = get_junk_insert_size(arch_name)
+        status['insert_size'] = int(insert_size)
+        print(f'   [junk 模式] 自动确定插入大小: {insert_size} 字节')
+
     if arch_key is not None and arch_spec is not None:
         print(f'   目标架构: {arch_key} ({arch_spec["bits"]}-bit)')
     else:
@@ -1940,8 +2021,8 @@ def main():
     parser.add_argument('--suffix', default='_packed', help='输出文件名后缀')
     parser.add_argument('--overwrite', action='store_true', help='覆盖已存在文件')
     parser.add_argument('--block-size', type=int, default=32, help='原始块大小（字节）')
-    parser.add_argument('--insert-size', type=int, default=64, help='插入块大小（字节）')
-    parser.add_argument('--insert-type', choices=['zero', 'nop', 'junk'], default='nop', help='插入内容类型（zero=全零, nop=NOP指令, junk=随机字节）')
+    parser.add_argument('--insert-size', type=int, default=64, help='插入块大小（字节）；junk 模式下自动确定，此参数被忽略')
+    parser.add_argument('--insert-type', choices=['zero', 'nop', 'junk'], default='nop', help='插入内容类型：zero=零字节，nop=NOP 指令，junk=循环插入5种 x86-64 反分析干扰指令（自动确定大小，忽略 --insert-size）')
     parser.add_argument('--machine', default='',
                         help='覆盖目标 e_machine（如 x86_64/i386/arm/aarch64/mips/ppc/sparc/sh/m68k/or1k/arc/xtensa/nios2，或数值如 62）')
     parser.add_argument('--stub-path', default='',
