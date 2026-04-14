@@ -562,6 +562,188 @@ def _elf_phdr_layout(file_path: Path, is64: bool) -> tuple[str, int, int, int]:
     return endian, int(e_phoff), int(e_phentsize), int(e_phnum)
 
 
+def _elf_phdr_layout_from_bytes(data: bytes, is64: bool) -> tuple[str, int, int, int]:
+    """Parse ELF program-header layout from in-memory bytes."""
+    if len(data) < 16 or data[:4] != b'\x7fELF':
+        raise RuntimeError('[-] 非 ELF 文件（内存）')
+    ei_data = data[5]
+    if ei_data == 1:
+        endian = '<'
+    elif ei_data == 2:
+        endian = '>'
+    else:
+        raise RuntimeError('[-] 不支持的 ELF 字节序（内存）')
+    if is64:
+        e_phoff     = struct.unpack_from(endian + 'Q', data, 0x20)[0]
+        e_phentsize = struct.unpack_from(endian + 'H', data, 0x36)[0]
+        e_phnum     = struct.unpack_from(endian + 'H', data, 0x38)[0]
+    else:
+        e_phoff     = struct.unpack_from(endian + 'I', data, 0x1C)[0]
+        e_phentsize = struct.unpack_from(endian + 'H', data, 0x2A)[0]
+        e_phnum     = struct.unpack_from(endian + 'H', data, 0x2C)[0]
+    return endian, int(e_phoff), int(e_phentsize), int(e_phnum)
+
+
+# Architectures that have mmap(MAP_FIXED|MAP_ANONYMOUS) support in the stub.
+# Track A: recover via disk read + mmap_fixed; PT_LOAD is nullified.
+# Track B (others): recover in-place from already-mapped polluted data; PT_LOAD kept.
+_MMAP_ARCH_KEYS: frozenset[str] = frozenset({'x86_64', 'i386', 'arm', 'aarch64'})
+
+
+def _arch_supports_mmap(arch_key: str | None) -> bool:
+    return arch_key in _MMAP_ARCH_KEYS
+
+
+def _apply_inplace_insertions(
+        file_bytes: bytes,
+        is64: bool,
+        recoverable_segs: list[dict],
+        block_size: int,
+        insert_size: int,
+        insert_type: str,
+        arch_name: str,
+) -> tuple[bytes, list[dict]]:
+    """
+    Apply insertion-pollution in-place to each recoverable PT_LOAD segment.
+
+    For each segment the original file data is replaced with the polluted
+    (block-inserted) version.  Zero padding is appended when needed so that
+    the next PT_LOAD's alignment invariant  p_offset ≡ p_vaddr (mod p_align)
+    is preserved.  All later segment p_offsets and e_shoff are updated
+    accordingly.
+
+    Returns:
+        (modified_bytes, recoverable_infos)
+
+    Each entry in recoverable_infos has:
+        vaddr         – original virtual address of the segment
+        size          – original file size (before insertion)
+        file_offset   – file offset of the polluted data in modified_bytes
+        block_size, insert_size, blocks
+    """
+    if not recoverable_segs:
+        return file_bytes, []
+
+    endian, e_phoff, e_phentsize, e_phnum = _elf_phdr_layout_from_bytes(file_bytes, is64)
+    width = 8 if is64 else 4
+
+    off_p_type   = 0
+    off_p_offset = 8  if is64 else 4
+    off_p_vaddr  = 16 if is64 else 8
+    off_p_filesz = 32 if is64 else 16
+    off_p_memsz  = 40 if is64 else 20
+    off_p_align  = 48 if is64 else 28
+    off_e_shoff  = 0x28 if is64 else 0x20
+
+    data = bytearray(file_bytes)
+
+    wfmt = endian + ('Q' if is64 else 'I')
+
+    def read_word(buf: bytearray, off: int) -> int:
+        return struct.unpack_from(wfmt, buf, off)[0]
+
+    def write_word(buf: bytearray, off: int, val: int) -> None:
+        struct.pack_into(wfmt, buf, off, val)
+
+    def ph_off(ph_idx: int, field_off: int) -> int:
+        return e_phoff + ph_idx * e_phentsize + field_off
+
+    def get_ph(buf: bytearray, ph_idx: int, field_off: int) -> int:
+        return read_word(buf, ph_off(ph_idx, field_off))
+
+    def set_ph(buf: bytearray, ph_idx: int, field_off: int, val: int) -> None:
+        write_word(buf, ph_off(ph_idx, field_off), val)
+
+    sorted_segs = sorted(recoverable_segs, key=lambda s: s['file_offset'])
+    recoverable_infos: list[dict] = []
+    cumulative_delta = 0
+
+    for seg in sorted_segs:
+        orig_file_offset = int(seg['file_offset'])
+        orig_file_size   = int(seg['file_size'])
+        vaddr            = int(seg['vaddr'])
+
+        current_offset = orig_file_offset + cumulative_delta
+
+        seg_data = bytes(data[current_offset:current_offset + orig_file_size])
+        polluted, blocks = build_polluted_text(
+            seg_data, block_size, insert_size, insert_type, arch_name)
+        polluted_size = len(polluted)
+        expansion = polluted_size - orig_file_size
+
+        # Find the next PT_LOAD in file-offset order to compute alignment padding.
+        after_orig = current_offset + orig_file_size
+        next_off: int | None = None
+        next_align: int | None = None
+        next_vaddr: int | None = None
+        for i in range(e_phnum):
+            p_type = struct.unpack_from(endian + 'I', data, ph_off(i, off_p_type))[0]
+            if p_type != 1:  # PT_LOAD only
+                continue
+            p_o = get_ph(data, i, off_p_offset)
+            if p_o >= after_orig:
+                if next_off is None or p_o < next_off:
+                    next_off   = p_o
+                    next_align = get_ph(data, i, off_p_align)
+                    next_vaddr = get_ph(data, i, off_p_vaddr)
+
+        # Compute zero-padding so next PT_LOAD alignment is maintained.
+        padding = 0
+        if next_off is not None and next_align and next_align > 1:
+            new_next = next_off + expansion
+            needed   = int(next_vaddr) % next_align
+            current  = new_next % next_align
+            if current != needed:
+                pad = needed - current
+                if pad <= 0:
+                    pad += next_align
+                padding = int(pad)
+
+        total_expansion = expansion + padding
+
+        # Replace original segment data with polluted + padding in the buffer.
+        new_data = bytearray()
+        new_data.extend(data[:current_offset])
+        new_data.extend(polluted)
+        new_data.extend(b'\x00' * padding)
+        new_data.extend(data[current_offset + orig_file_size:])
+        data = new_data
+
+        # Shift p_offset for all segments whose data starts after this segment.
+        for i in range(e_phnum):
+            p_o = get_ph(data, i, off_p_offset)
+            if p_o >= after_orig:
+                set_ph(data, i, off_p_offset, p_o + total_expansion)
+
+        # Update p_filesz / p_memsz for the current recoverable segment.
+        for i in range(e_phnum):
+            p_o = get_ph(data, i, off_p_offset)
+            p_v = get_ph(data, i, off_p_vaddr)
+            if p_o == current_offset and p_v == vaddr:
+                set_ph(data, i, off_p_filesz, polluted_size)
+                p_msz = get_ph(data, i, off_p_memsz)
+                if p_msz < polluted_size:
+                    set_ph(data, i, off_p_memsz, polluted_size)
+                break
+
+        # Update section-header offset if it follows the modified region.
+        e_shoff_val = read_word(data, off_e_shoff)
+        if e_shoff_val >= after_orig:
+            write_word(data, off_e_shoff, e_shoff_val + total_expansion)
+
+        recoverable_infos.append({
+            'vaddr':       vaddr,
+            'size':        orig_file_size,
+            'file_offset': current_offset,
+            'block_size':  block_size,
+            'insert_size': insert_size,
+            'blocks':      blocks,
+        })
+        cumulative_delta += total_expansion
+
+    return bytes(data), recoverable_infos
+
+
 def _nullify_recoverable_ptloads(
         output_file: Path,
         is64: bool,
@@ -1244,37 +1426,29 @@ def create_convex_hull_elf(
         source_path: Path,
         binary: lief.ELF.Binary,
         convex_info: dict,
-        convex_content: bytes,
         stub_entry_offset: int,
         stub_blob: bytes,
         is64: bool,
 ) -> tuple[lief.ELF.Binary, int, int, int]:
     """
-    Preserve the original ELF program-header layout (incl. PT_INTERP/PT_DYNAMIC)
-    and add one extra convex PT_LOAD that stores:
-        [stub_blob][convex_content]
+    Re-parse *source_path* (which already contains the in-place-polluted PT_LOADs)
+    and append a single stub-only PT_LOAD segment.
 
     Returns:
         (new_binary, convex_va, entry_vaddr, relocated_original_oep)
     """
-    # Re-parse to get a writable copy
     new_binary = lief.parse(str(source_path))
     if not new_binary:
         raise RuntimeError(f"[-] 无法重新解析 ELF: {source_path}")
 
-    combined = stub_blob + convex_content
-
-    # Add convex storage segment; keep original PT_LOAD/PT_DYNAMIC/PT_INTERP intact.
     seg = lief.ELF.Segment()
     seg.type = lief.ELF.Segment.TYPE.LOAD
     seg.flags = lief.ELF.Segment.FLAGS.R | lief.ELF.Segment.FLAGS.W | lief.ELF.Segment.FLAGS.X
     seg.alignment = 0x1000
-    seg.content = combined
+    seg.content = list(stub_blob)
 
     added = new_binary.add(seg)
     convex_va = int(added.virtual_address)
-    # LIEF may relocate existing segments/entrypoint after adding a segment.
-    # Capture the post-layout original OEP before switching entry to stub.
     relocated_original_oep = int(new_binary.header.entrypoint)
     entry_vaddr = convex_va + stub_entry_offset
     new_binary.header.entrypoint = entry_vaddr
@@ -1294,7 +1468,7 @@ def _patch_convex_hull_stub(
         header_info: dict,
         recoverable_infos: list[dict],
         protected_infos: list[dict],
-        stub_blob_size: int,
+        _stub_blob_size: int,
         stub_symbol_offsets: dict[str, int],
 ):
     """Patch all stub variables directly into the packed ELF on disk."""
@@ -1307,10 +1481,6 @@ def _patch_convex_hull_stub(
         if idx is not None:
             off += idx * width
         return off
-
-    def content_va_off(offset_in_content: int) -> int:
-        """Byte offset from CONVEX_MIN_VADDR to convex_content[offset]."""
-        return stub_blob_size + offset_in_content
 
     print('    打补丁...')
 
@@ -1348,7 +1518,7 @@ def _patch_convex_hull_stub(
         patch_value(output_file, stub_file_off('REGION_DELETES', i), r['insert_size'], width)
         patch_value(output_file, stub_file_off('REGION_BLOCKS',  i), r['blocks'], width)
         patch_value(output_file, stub_file_off('REGION_OFFSETS', i),
-                    content_va_off(r['offset_in_content']), width)
+                    r['file_offset'], width)
 
     # ── Protected (non-pollutable) PT_LOAD regions ───────────────────
     # Do not overwrite loader-relocated data (.got/.dynamic etc.) at runtime.
@@ -1459,23 +1629,49 @@ def pack_with_convex_hull(target_file: Path,
     status['convex_size'] = int(convex_info['size'])
     status['convex_load_count'] = int(convex_info['count'])
     
-    # 构建凸包内容
-    print('   构建污染数据...')
+    # 对可恢复 PT_LOAD 段执行原地插入污染
+    print('   原地插入污染...')
+    load_segs = sorted(
+        [(seg, int(seg.file_offset), int(seg.physical_size))
+         for _, seg in convex_info['segments']],
+        key=lambda t: t[0].virtual_address,
+    )
+    rec_segs_input = []
+    protected_infos: list[dict] = []
+    for seg, foff, fsize in load_segs:
+        if is_segment_protectable(binary, seg):
+            protected_infos.append({
+                'vaddr': int(seg.virtual_address),
+                'size':  fsize,
+            })
+        else:
+            rec_segs_input.append({
+                'vaddr':       int(seg.virtual_address),
+                'file_offset': foff,
+                'file_size':   fsize,
+            })
+
     try:
-        convex_content, header_info, recoverable_infos, protected_infos = \
-            build_convex_hull_content(
-                binary, convex_info, file_bytes,
-                block_size, insert_size, insert_type, arch_name
-            )
+        modified_bytes, recoverable_infos = _apply_inplace_insertions(
+            file_bytes, is64, rec_segs_input,
+            block_size, insert_size, insert_type, arch_name,
+        )
     except Exception as e:
         print(f'[-] {e}')
         return fail(str(e))
 
-    print(f'     凸包内容大小: {len(convex_content)} 字节')
     print(f'     可污染段数: {len(recoverable_infos)}, 受保护段数: {len(protected_infos)}')
-    status['convex_content_size'] = int(len(convex_content))
     status['recoverable_segments'] = int(len(recoverable_infos))
     status['protected_segments'] = int(len(protected_infos))
+
+    # 写修改后的字节到临时文件
+    temp_modified_file = Path(str(temp_file) + '.inplace')
+    try:
+        with open(temp_modified_file, 'wb') as f:
+            f.write(modified_bytes)
+    except Exception as e:
+        print(f'[-] 写临时修改文件失败: {e}')
+        return fail(f'写临时修改文件失败: {e}')
 
     # 记录原始 OEP（用于计算布局重排偏移）
     original_oep_before_layout = int(binary.header.entrypoint)
@@ -1546,11 +1742,11 @@ def pack_with_convex_hull(target_file: Path,
         print(f'[-] {e}')
         return fail(str(e))
     
-    # 创建凸包 ELF
+    # 创建凸包 ELF（仅含 stub 段）
     print('   创建凸包 ELF...')
     try:
         new_binary, convex_va, entry_vaddr, relocated_oep = create_convex_hull_elf(
-            target_file, binary, convex_info, convex_content,
+            temp_modified_file, binary, convex_info,
             stub_entry_offset, stub_blob, is64
         )
         vaddr_shift = int(relocated_oep) - int(original_oep_before_layout)
@@ -1571,10 +1767,30 @@ def pack_with_convex_hull(target_file: Path,
         print(f'[-] 写输出文件失败: {e}')
         return fail(f'写输出文件失败: {e}')
 
-    # 头部重建语义：
-    # - 保留不可改 PT_LOAD
-    # - 将可恢复 PT_LOAD 失活（PT_NULL）
-    # - 运行时由 stub 从 convex 段恢复并 map 回目标虚拟地址
+    # 重新解析输出文件，获取各可恢复段在输出文件中的实际文件偏移。
+    # 这些偏移在 Track A 架构中由 stub 用于从磁盘读取污染数据。
+    try:
+        out_bin_pre = lief.parse(str(output_file))
+        if not out_bin_pre:
+            msg = '无法解析输出 ELF（预失活）'
+            print(f'[-] {msg}')
+            return fail(msg)
+        for r_info in recoverable_infos:
+            target_va = int(r_info['vaddr']) + vaddr_shift
+            for seg in out_bin_pre.segments:
+                if seg.type != lief.ELF.Segment.TYPE.LOAD:
+                    continue
+                if int(seg.virtual_address) == target_va:
+                    r_info['file_offset'] = int(seg.file_offset)
+                    break
+    except Exception as e:
+        print(f'[-] 解析输出布局（预失活）失败: {e}')
+        return fail(f'解析输出布局（预失活）失败: {e}')
+
+    # Track A：将可恢复 PT_LOAD 失活（PT_NULL），原地污染数据留在文件中供 stub 读取。
+    # Track B：保留 PT_LOAD，OS 直接加载污染数据，stub 在内存中原地恢复。
+    use_mmap_approach = _arch_supports_mmap(arch_key)
+    nullify_list = recoverable_infos if use_mmap_approach else []
     nulled = 0
     changed = 0
     mode = 'none'
@@ -1582,26 +1798,22 @@ def pack_with_convex_hull(target_file: Path,
         nulled, changed, mode = _nullify_recoverable_ptloads(
             output_file=output_file,
             is64=is64,
-            recoverable_infos=recoverable_infos,
+            recoverable_infos=nullify_list,
             vaddr_shift=vaddr_shift,
-            strip_plaintext=strip_recoverable_plaintext,
-            prune_bytes=prune_recoverable_bytes,
-            prune_pages=prune_recoverable_pages,
+            strip_plaintext=False,  # 污染数据必须保留供 stub 读取/使用
+            prune_bytes=False,
+            prune_pages=False,
         )
-        print(f'   Program Header 重写: PT_NULL 化可恢复 PT_LOAD = {nulled}')
-        if strip_recoverable_plaintext:
-            if mode == 'byte-prune':
-                print(f'   字节级裁剪: 删除可恢复段精确字节 = {changed} 字节')
-            elif mode == 'prune':
-                print(f'   页级裁剪: 裁剪可恢复段相关页面 = {changed} 字节')
-            elif mode == 'wipe':
-                print(f'   明文覆写: 覆写可恢复段原始字节 = {changed} 字节')
+        if use_mmap_approach:
+            print(f'   Program Header 重写: PT_NULL 化可恢复 PT_LOAD = {nulled}')
+        else:
+            print(f'   Program Header 保留: Track B 架构原地恢复，保留 PT_LOAD')
     except Exception as e:
         print(f'[-] 重写 Program Header 失败: {e}')
         return fail(f'重写 Program Header 失败: {e}')
     status['nulled_recoverable_ptloads'] = int(nulled)
     status['plaintext_changed_bytes'] = int(changed)
-    status['plaintext_handling_mode'] = str(mode)
+    status['plaintext_handling_mode'] = 'inplace-disk' if use_mmap_approach else 'inplace-memory'
 
     # 重新解析，定位新增 stub 段的文件偏移
     try:
@@ -1630,11 +1842,16 @@ def pack_with_convex_hull(target_file: Path,
     
     # 打补丁
     print('   打补丁...')
+    # 创建哑 header_info（头部恢复已禁用）
+    header_info = {
+        'vaddr': 0, 'size': 0, 'offset_in_content': 0,
+        'block_size': block_size, 'insert_size': insert_size, 'blocks': 0,
+    }
     try:
         _patch_convex_hull_stub(
             temp_file, output_file, None, is64,
             convex_info, convex_va, stub_file_start, relocated_oep, vaddr_shift,
-            header_info, recoverable_infos, protected_infos,
+            header_info, recoverable_infos, [],
             len(stub_blob), stub_symbol_offsets
         )
     except Exception as e:
@@ -1646,14 +1863,19 @@ def pack_with_convex_hull(target_file: Path,
         shutil.copymode(target_file, output_file)
     except Exception:
         pass
+
+    # 清理临时文件
+    try:
+        temp_modified_file.unlink(missing_ok=True)
+    except Exception:
+        pass
     
-    header_blocks = int(header_info['blocks'])
     recoverable_blocks = int(sum(r['blocks'] for r in recoverable_infos))
-    total_blocks = header_blocks + recoverable_blocks
-    status['header_blocks'] = header_blocks
+    total_blocks = recoverable_blocks
+    status['header_blocks'] = 0
     status['recoverable_blocks'] = recoverable_blocks
     status['total_blocks'] = total_blocks
-    status['obfuscation_inserted_bytes_header'] = header_blocks * int(insert_size)
+    status['obfuscation_inserted_bytes_header'] = 0
     status['obfuscation_inserted_bytes_recoverable'] = recoverable_blocks * int(insert_size)
     status['obfuscation_inserted_bytes_excluding_stub'] = total_blocks * int(insert_size)
     status['convex_va'] = int(convex_va)
@@ -1664,10 +1886,10 @@ def pack_with_convex_hull(target_file: Path,
         pass
 
     print(f'[+] 已生成: {output_file}')
-    print(f'[+] 凸包模式：stub@{hex(convex_va)}，'
-          f'覆盖 {convex_info["count"]} 个原始段')
+    print(f'[+] 原地插入模式：stub@{hex(convex_va)}，'
+          f'污染 {len(recoverable_infos)} 个可恢复段，{len(protected_infos)} 个受保护段')
     print(f'[+] 原始虚拟地址范围: {hex(convex_info["min_vaddr"])} - {hex(convex_info["max_vaddr"])}')
-    print(f'[+] 共污染 {total_blocks} 个块，受保护段 {len(protected_infos)} 个\n')
+    print(f'[+] 共污染 {total_blocks} 个块\n')
     status['success'] = True
     return True, status
 

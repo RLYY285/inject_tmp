@@ -205,10 +205,35 @@ volatile uint32_t SAVED_R5 = 0;
 #define SYS_MPROTECT 10
 #define SYS_EXIT     60
 #define SYS_MMAP     9
+#define SYS_OPEN     2
+#define SYS_CLOSE    3
+#define SYS_READ     0
+#define SYS_LSEEK    8
 #elif defined(ARCH_AARCH64)
 #define SYS_MPROTECT 226
 #define SYS_EXIT     93
 #define SYS_MMAP     222
+#define SYS_OPENAT   56
+#define AT_FDCWD     -100
+#define SYS_CLOSE    57
+#define SYS_READ     63
+#define SYS_LSEEK    62
+#elif defined(ARCH_X86)
+#define SYS_MPROTECT 125
+#define SYS_EXIT     1
+#define SYS_MMAP     192   /* mmap2 */
+#define SYS_OPEN     5
+#define SYS_CLOSE    6
+#define SYS_READ     3
+#define SYS_LSEEK    19
+#elif defined(ARCH_ARM)
+#define SYS_MPROTECT 125
+#define SYS_EXIT     1
+#define SYS_MMAP     192   /* mmap2 */
+#define SYS_OPEN     5
+#define SYS_CLOSE    6
+#define SYS_READ     3
+#define SYS_LSEEK    19
 #elif defined(ARCH_MIPS)
 #define SYS_MPROTECT 4125
 #define SYS_EXIT     4001
@@ -300,6 +325,18 @@ static inline long my_syscall6(long n, long a1, long a2, long a3, long a4, long 
     __asm__ volatile ("svc #0"
         : "+r"(x0)
         : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8)
+        : "memory", "cc");
+    return x0;
+}
+static inline long my_syscall4(long n, long a1, long a2, long a3, long a4) {
+    register long x0 __asm__("x0") = a1;
+    register long x1 __asm__("x1") = a2;
+    register long x2 __asm__("x2") = a3;
+    register long x3 __asm__("x3") = a4;
+    register long x8 __asm__("x8") = n;
+    __asm__ volatile ("svc #0"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x8)
         : "memory", "cc");
     return x0;
 }
@@ -535,6 +572,25 @@ static inline int make_writable(uaddr_t target_addr, uaddr_t size) {
 }
 #endif
 
+#if defined(ARCH_X64) || defined(ARCH_X86) || defined(ARCH_AARCH64) || defined(ARCH_ARM)
+/* Path to the running executable for reading polluted segment data. */
+STUB_TEXT_SYM volatile uint8_t SELF_EXE_PATH[16] = {
+    '/', 'p', 'r', 'o', 'c', '/', 's', 'e', 'l', 'f', '/', 'e', 'x', 'e', '\0', '\0'
+};
+
+/* Read exactly `count` bytes from fd into buf; returns bytes actually read. */
+static inline uaddr_t my_read_all(long fd, uint8_t *buf, uaddr_t count) {
+    uaddr_t total = 0;
+    while (total < count) {
+        long rc = my_syscall3(SYS_READ, fd, (long)(uintptr_t)(buf + total),
+                              (long)(count - total));
+        if (rc <= 0) return total;
+        total += (uaddr_t)rc;
+    }
+    return total;
+}
+#endif
+
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 6. 删块恢复函数
@@ -658,67 +714,47 @@ static int compact_in_place(
 static __attribute__((noinline)) void stub_main(void) {
     uaddr_t runtime_addr_of_voffset = (uaddr_t)(uintptr_t)&STUB_VOFFSET;
     uaddr_t load_base = runtime_addr_of_voffset - STUB_VOFFSET;
-    uaddr_t convex_base = load_base + CONVEX_MIN_VADDR;
     uaddr_t new_oep = load_base + OEP_ADDR;
     uaddr_t count = REGION_COUNT;
-    uaddr_t prot_count = PROTECTED_COUNT;
     uaddr_t i;
     uaddr_t dummy;
     int rc;
 
     if (count > STUB_MAX_REGIONS) count = STUB_MAX_REGIONS;
-    if (prot_count > STUB_MAX_REGIONS) prot_count = STUB_MAX_REGIONS;
 
-    /* Phase 1: recover polluted (recoverable) PT_LOAD regions */
+    /* Phase 1: read polluted PT_LOAD data from disk, restore, map at original VA */
+    long exe_fd = my_syscall3(SYS_OPEN, (long)(uintptr_t)SELF_EXE_PATH, 0L, 0L);
+    if (exe_fd < 0) fail_exit(6);
+
     for (i = 0; i < count; i++) {
         uaddr_t region_vaddr  = load_base + REGION_ADDRS[i];
         uaddr_t region_size   = REGION_SIZES[i];
         uaddr_t retain        = REGION_RETAINS[i];
         uaddr_t del           = REGION_DELETES[i];
         uaddr_t blocks        = REGION_BLOCKS[i];
-        uaddr_t src           = convex_base + REGION_OFFSETS[i];
+        uaddr_t file_offset   = REGION_OFFSETS[i];
         uaddr_t polluted_size = region_size + blocks * del;
 
         if (!region_size || !retain) continue;
 
-        uaddr_t temp = alloc_temp(region_size);
+        uaddr_t read_buf = alloc_temp(polluted_size);
+        if (my_syscall3(SYS_LSEEK, exe_fd, (long)file_offset, 0L) < 0) fail_exit(7);
+        if (my_read_all(exe_fd, (uint8_t *)read_buf, polluted_size) != polluted_size) fail_exit(8);
+
+        uaddr_t out_buf = alloc_temp(region_size);
         rc = compact_in_place(
-            (uint8_t *)src, (uint8_t *)temp,
+            (uint8_t *)read_buf, (uint8_t *)out_buf,
             polluted_size, retain, del, blocks,
             (uaddr_t)-1, &dummy
         );
         if (rc != 0) fail_exit(1);
         map_fixed(region_vaddr, region_size);
-        memcpy_safe((uint8_t *)region_vaddr, (uint8_t *)temp, region_size);
+        memcpy_safe((uint8_t *)region_vaddr, (uint8_t *)out_buf, region_size);
     }
 
-    /* Phase 2: copy protected (non-pollutable) PT_LOAD regions */
-    for (i = 0; i < prot_count; i++) {
-        uaddr_t vaddr = load_base + PROTECTED_ADDRS[i];
-        uaddr_t size  = PROTECTED_SIZES[i];
-        uaddr_t src   = convex_base + PROTECTED_OFFSETS[i];
+    my_syscall1(SYS_CLOSE, exe_fd);
 
-        if (!size) continue;
-        map_fixed(vaddr, size);
-        memcpy_safe((uint8_t *)vaddr, (uint8_t *)src, size);
-    }
-
-    /* Phase 3: recover ELF header */
-    if (HEADER_SIZE && HEADER_RETAIN) {
-        uaddr_t hdr_src      = convex_base + HEADER_OFFSET;
-        uaddr_t hdr_polluted = HEADER_SIZE + HEADER_BLOCKS * HEADER_DELETE;
-        uaddr_t hdr_temp     = alloc_temp(HEADER_SIZE);
-        rc = compact_in_place(
-            (uint8_t *)hdr_src, (uint8_t *)hdr_temp,
-            hdr_polluted, HEADER_RETAIN, HEADER_DELETE, HEADER_BLOCKS,
-            (uaddr_t)-1, &dummy
-        );
-        if (rc != 0) fail_exit(1);
-        map_fixed(load_base + HEADER_VADDR, HEADER_SIZE);
-        memcpy_safe((uint8_t *)(load_base + HEADER_VADDR), (uint8_t *)hdr_temp, HEADER_SIZE);
-    }
-
-    /* Phase 4: jump to OEP */
+    /* Phase 2: jump to OEP */
     __asm__ volatile (
         "mov %0, %%rdx\n\t"
         "mov %1, %%rsp\n\t"
@@ -769,84 +805,54 @@ static __attribute__((noinline)) void stub_main(uint8_t *stub_base) {
     volatile uint32_t *region_retain_p = (volatile uint32_t*)(stub_base + OFF(REGION_RETAINS));
     volatile uint32_t *region_delete_p = (volatile uint32_t*)(stub_base + OFF(REGION_DELETES));
     volatile uint32_t *region_blocks_p = (volatile uint32_t*)(stub_base + OFF(REGION_BLOCKS));
+    volatile uint32_t *region_offs_p   = (volatile uint32_t*)(stub_base + OFF(REGION_OFFSETS));
     volatile uint32_t *saved_esp_p     = (volatile uint32_t*)(stub_base + OFF(SAVED_ESP));
     volatile uint32_t *saved_edx_p     = (volatile uint32_t*)(stub_base + OFF(SAVED_EDX));
-    volatile uint32_t *convex_base_p   = (volatile uint32_t*)(stub_base + OFF(CONVEX_MIN_VADDR));
-    volatile uint32_t *region_offs_p   = (volatile uint32_t*)(stub_base + OFF(REGION_OFFSETS));
-    volatile uint32_t *prot_count_p    = (volatile uint32_t*)(stub_base + OFF(PROTECTED_COUNT));
-    volatile uint32_t *prot_addrs_p    = (volatile uint32_t*)(stub_base + OFF(PROTECTED_ADDRS));
-    volatile uint32_t *prot_sizes_p    = (volatile uint32_t*)(stub_base + OFF(PROTECTED_SIZES));
-    volatile uint32_t *prot_offs_p     = (volatile uint32_t*)(stub_base + OFF(PROTECTED_OFFSETS));
-    volatile uint32_t *hdr_vaddr_p     = (volatile uint32_t*)(stub_base + OFF(HEADER_VADDR));
-    volatile uint32_t *hdr_off_p       = (volatile uint32_t*)(stub_base + OFF(HEADER_OFFSET));
-    volatile uint32_t *hdr_size_p      = (volatile uint32_t*)(stub_base + OFF(HEADER_SIZE));
-    volatile uint32_t *hdr_retain_p    = (volatile uint32_t*)(stub_base + OFF(HEADER_RETAIN));
-    volatile uint32_t *hdr_del_p       = (volatile uint32_t*)(stub_base + OFF(HEADER_DELETE));
-    volatile uint32_t *hdr_blocks_p    = (volatile uint32_t*)(stub_base + OFF(HEADER_BLOCKS));
 
     uint32_t runtime_addr_of_voffset = (uint32_t)(uintptr_t)(stub_base + OFF(STUB_VOFFSET));
     uint32_t load_base = runtime_addr_of_voffset - (*voffset_p);
-    uint32_t new_oep    = load_base + (*oep_ptr);
-    uint32_t convex_base = load_base + (*convex_base_p);
-    uint32_t count      = *region_count_p;
-    uint32_t prot_count = *prot_count_p;
+    uint32_t new_oep   = load_base + (*oep_ptr);
+    uint32_t count     = *region_count_p;
     uint32_t i;
     uint32_t dummy;
     int rc;
 
     if (count > STUB_MAX_REGIONS) count = STUB_MAX_REGIONS;
-    if (prot_count > STUB_MAX_REGIONS) prot_count = STUB_MAX_REGIONS;
 
-    /* Phase 1: recover polluted PT_LOAD regions */
+    /* Phase 1: read polluted PT_LOAD data from disk, restore, map at original VA */
+    long exe_fd = my_syscall3(SYS_OPEN,
+        (long)(uintptr_t)(stub_base + OFF(SELF_EXE_PATH)), 0L, 0L);
+    if (exe_fd < 0) fail_exit(6);
+
     for (i = 0; i < count; i++) {
         uint32_t region_vaddr  = load_base + region_addrs_p[i];
         uint32_t region_size   = region_sizes_p[i];
         uint32_t retain        = region_retain_p[i];
         uint32_t del           = region_delete_p[i];
         uint32_t blocks        = region_blocks_p[i];
-        uint32_t src           = convex_base + region_offs_p[i];
+        uint32_t file_offset   = region_offs_p[i];
         uint32_t polluted_size = region_size + blocks * del;
 
         if (!region_size || !retain) continue;
 
-        uint32_t temp = (uint32_t)alloc_temp(region_size);
+        uint32_t read_buf = (uint32_t)alloc_temp(polluted_size);
+        if (my_syscall3(SYS_LSEEK, exe_fd, (long)file_offset, 0L) < 0) fail_exit(7);
+        if (my_read_all(exe_fd, (uint8_t *)read_buf, polluted_size) != polluted_size) fail_exit(8);
+
+        uint32_t out_buf = (uint32_t)alloc_temp(region_size);
         rc = compact_in_place(
-            (uint8_t *)src, (uint8_t *)temp,
+            (uint8_t *)read_buf, (uint8_t *)out_buf,
             polluted_size, retain, del, blocks,
             (uaddr_t)-1, (uaddr_t *)&dummy
         );
         if (rc != 0) fail_exit(1);
         map_fixed(region_vaddr, region_size);
-        memcpy_safe((uint8_t *)region_vaddr, (uint8_t *)temp, region_size);
+        memcpy_safe((uint8_t *)region_vaddr, (uint8_t *)out_buf, region_size);
     }
 
-    /* Phase 2: copy protected PT_LOAD regions */
-    for (i = 0; i < prot_count; i++) {
-        uint32_t vaddr = load_base + prot_addrs_p[i];
-        uint32_t size  = prot_sizes_p[i];
-        uint32_t src   = convex_base + prot_offs_p[i];
+    my_syscall1(SYS_CLOSE, exe_fd);
 
-        if (!size) continue;
-        map_fixed(vaddr, size);
-        memcpy_safe((uint8_t *)vaddr, (uint8_t *)src, size);
-    }
-
-    /* Phase 3: recover ELF header */
-    if (*hdr_size_p && *hdr_retain_p) {
-        uint32_t hdr_src      = convex_base + *hdr_off_p;
-        uint32_t hdr_polluted = *hdr_size_p + *hdr_blocks_p * *hdr_del_p;
-        uint32_t hdr_temp     = (uint32_t)alloc_temp(*hdr_size_p);
-        rc = compact_in_place(
-            (uint8_t *)hdr_src, (uint8_t *)hdr_temp,
-            hdr_polluted, *hdr_retain_p, *hdr_del_p, *hdr_blocks_p,
-            (uaddr_t)-1, (uaddr_t *)&dummy
-        );
-        if (rc != 0) fail_exit(1);
-        map_fixed(load_base + *hdr_vaddr_p, *hdr_size_p);
-        memcpy_safe((uint8_t *)(load_base + *hdr_vaddr_p), (uint8_t *)hdr_temp, *hdr_size_p);
-    }
-
-    /* Phase 4: jump to OEP */
+    /* Phase 2: jump to OEP */
     __asm__ volatile (
         "movl %0, %%edx\n\t"
         "movl %1, %%esp\n\t"
@@ -884,67 +890,48 @@ void _start(void) {
 static __attribute__((noinline)) void stub_main(void) {
     uaddr_t runtime_addr_of_voffset = (uaddr_t)(uintptr_t)&STUB_VOFFSET;
     uaddr_t load_base  = runtime_addr_of_voffset - STUB_VOFFSET;
-    uaddr_t convex_base = load_base + CONVEX_MIN_VADDR;
     uaddr_t new_oep    = load_base + OEP_ADDR;
     uaddr_t count      = REGION_COUNT;
-    uaddr_t prot_count = PROTECTED_COUNT;
     uaddr_t i;
     uaddr_t dummy;
     int rc;
 
     if (count > STUB_MAX_REGIONS) count = STUB_MAX_REGIONS;
-    if (prot_count > STUB_MAX_REGIONS) prot_count = STUB_MAX_REGIONS;
 
-    /* Phase 1: recover polluted PT_LOAD regions */
+    /* Phase 1: read polluted PT_LOAD data from disk, restore, map at original VA */
+    long exe_fd = my_syscall4(SYS_OPENAT, (long)AT_FDCWD,
+                              (long)(uintptr_t)SELF_EXE_PATH, 0L, 0L);
+    if (exe_fd < 0) fail_exit(6);
+
     for (i = 0; i < count; i++) {
         uaddr_t region_vaddr  = load_base + REGION_ADDRS[i];
         uaddr_t region_size   = REGION_SIZES[i];
         uaddr_t retain        = REGION_RETAINS[i];
         uaddr_t del           = REGION_DELETES[i];
         uaddr_t blocks        = REGION_BLOCKS[i];
-        uaddr_t src           = convex_base + REGION_OFFSETS[i];
+        uaddr_t file_offset   = REGION_OFFSETS[i];
         uaddr_t polluted_size = region_size + blocks * del;
 
         if (!region_size || !retain) continue;
 
-        uaddr_t temp = alloc_temp(region_size);
+        uaddr_t read_buf = alloc_temp(polluted_size);
+        if (my_syscall3(SYS_LSEEK, exe_fd, (long)file_offset, 0L) < 0) fail_exit(7);
+        if (my_read_all(exe_fd, (uint8_t *)read_buf, polluted_size) != polluted_size) fail_exit(8);
+
+        uaddr_t out_buf = alloc_temp(region_size);
         rc = compact_in_place(
-            (uint8_t *)src, (uint8_t *)temp,
+            (uint8_t *)read_buf, (uint8_t *)out_buf,
             polluted_size, retain, del, blocks,
             (uaddr_t)-1, &dummy
         );
         if (rc != 0) fail_exit(1);
         map_fixed(region_vaddr, region_size);
-        memcpy_safe((uint8_t *)region_vaddr, (uint8_t *)temp, region_size);
+        memcpy_safe((uint8_t *)region_vaddr, (uint8_t *)out_buf, region_size);
     }
 
-    /* Phase 2: copy protected PT_LOAD regions */
-    for (i = 0; i < prot_count; i++) {
-        uaddr_t vaddr = load_base + PROTECTED_ADDRS[i];
-        uaddr_t size  = PROTECTED_SIZES[i];
-        uaddr_t src   = convex_base + PROTECTED_OFFSETS[i];
+    my_syscall1(SYS_CLOSE, exe_fd);
 
-        if (!size) continue;
-        map_fixed(vaddr, size);
-        memcpy_safe((uint8_t *)vaddr, (uint8_t *)src, size);
-    }
-
-    /* Phase 3: recover ELF header */
-    if (HEADER_SIZE && HEADER_RETAIN) {
-        uaddr_t hdr_src      = convex_base + HEADER_OFFSET;
-        uaddr_t hdr_polluted = HEADER_SIZE + HEADER_BLOCKS * HEADER_DELETE;
-        uaddr_t hdr_temp     = alloc_temp(HEADER_SIZE);
-        rc = compact_in_place(
-            (uint8_t *)hdr_src, (uint8_t *)hdr_temp,
-            hdr_polluted, HEADER_RETAIN, HEADER_DELETE, HEADER_BLOCKS,
-            (uaddr_t)-1, &dummy
-        );
-        if (rc != 0) fail_exit(1);
-        map_fixed(load_base + HEADER_VADDR, HEADER_SIZE);
-        memcpy_safe((uint8_t *)(load_base + HEADER_VADDR), (uint8_t *)hdr_temp, HEADER_SIZE);
-    }
-
-    /* Phase 4: jump to OEP */
+    /* Phase 2: jump to OEP */
     __asm__ volatile (
         "mov x0, %0\n\t"
         "mov x1, %1\n\t"
@@ -994,67 +981,47 @@ __attribute__((naked)) void _start(void) {
 static __attribute__((noinline)) void stub_main(void) {
     uaddr_t runtime_addr_of_voffset = (uaddr_t)(uintptr_t)&STUB_VOFFSET;
     uaddr_t load_base  = runtime_addr_of_voffset - STUB_VOFFSET;
-    uaddr_t convex_base = load_base + CONVEX_MIN_VADDR;
     uaddr_t new_oep    = load_base + OEP_ADDR;
     uaddr_t count      = REGION_COUNT;
-    uaddr_t prot_count = PROTECTED_COUNT;
     uaddr_t i;
     uaddr_t dummy;
     int rc;
 
     if (count > STUB_MAX_REGIONS) count = STUB_MAX_REGIONS;
-    if (prot_count > STUB_MAX_REGIONS) prot_count = STUB_MAX_REGIONS;
 
-    /* Phase 1: recover polluted PT_LOAD regions */
+    /* Phase 1: read polluted PT_LOAD data from disk, restore, map at original VA */
+    long exe_fd = my_syscall3(SYS_OPEN, (long)(uintptr_t)SELF_EXE_PATH, 0L, 0L);
+    if (exe_fd < 0) fail_exit(6);
+
     for (i = 0; i < count; i++) {
         uaddr_t region_vaddr  = load_base + REGION_ADDRS[i];
         uaddr_t region_size   = REGION_SIZES[i];
         uaddr_t retain        = REGION_RETAINS[i];
         uaddr_t del           = REGION_DELETES[i];
         uaddr_t blocks        = REGION_BLOCKS[i];
-        uaddr_t src           = convex_base + REGION_OFFSETS[i];
+        uaddr_t file_offset   = REGION_OFFSETS[i];
         uaddr_t polluted_size = region_size + blocks * del;
 
         if (!region_size || !retain) continue;
 
-        uaddr_t temp = alloc_temp(region_size);
+        uaddr_t read_buf = alloc_temp(polluted_size);
+        if (my_syscall3(SYS_LSEEK, exe_fd, (long)file_offset, 0L) < 0) fail_exit(7);
+        if (my_read_all(exe_fd, (uint8_t *)read_buf, polluted_size) != polluted_size) fail_exit(8);
+
+        uaddr_t out_buf = alloc_temp(region_size);
         rc = compact_in_place(
-            (uint8_t *)src, (uint8_t *)temp,
+            (uint8_t *)read_buf, (uint8_t *)out_buf,
             polluted_size, retain, del, blocks,
             (uaddr_t)-1, (uaddr_t *)&dummy
         );
         if (rc != 0) fail_exit(1);
         map_fixed(region_vaddr, region_size);
-        memcpy_safe((uint8_t *)region_vaddr, (uint8_t *)temp, region_size);
+        memcpy_safe((uint8_t *)region_vaddr, (uint8_t *)out_buf, region_size);
     }
 
-    /* Phase 2: copy protected PT_LOAD regions */
-    for (i = 0; i < prot_count; i++) {
-        uaddr_t vaddr = load_base + PROTECTED_ADDRS[i];
-        uaddr_t size  = PROTECTED_SIZES[i];
-        uaddr_t src   = convex_base + PROTECTED_OFFSETS[i];
+    my_syscall1(SYS_CLOSE, exe_fd);
 
-        if (!size) continue;
-        map_fixed(vaddr, size);
-        memcpy_safe((uint8_t *)vaddr, (uint8_t *)src, size);
-    }
-
-    /* Phase 3: recover ELF header */
-    if (HEADER_SIZE && HEADER_RETAIN) {
-        uaddr_t hdr_src      = convex_base + HEADER_OFFSET;
-        uaddr_t hdr_polluted = HEADER_SIZE + HEADER_BLOCKS * HEADER_DELETE;
-        uaddr_t hdr_temp     = alloc_temp(HEADER_SIZE);
-        rc = compact_in_place(
-            (uint8_t *)hdr_src, (uint8_t *)hdr_temp,
-            hdr_polluted, HEADER_RETAIN, HEADER_DELETE, HEADER_BLOCKS,
-            (uaddr_t)-1, (uaddr_t *)&dummy
-        );
-        if (rc != 0) fail_exit(1);
-        map_fixed(load_base + HEADER_VADDR, HEADER_SIZE);
-        memcpy_safe((uint8_t *)(load_base + HEADER_VADDR), (uint8_t *)hdr_temp, HEADER_SIZE);
-    }
-
-    /* Phase 4: jump to OEP */
+    /* Phase 2: jump to OEP */
     __asm__ volatile (
         "mov r0, %0\n\t"
         "mov r1, %1\n\t"
@@ -1098,64 +1065,35 @@ static __attribute__((noinline)) void stub_main(uint32_t saved_sp, uint32_t save
                                                 uint32_t saved_r5, uint32_t saved_r6) {
     uint32_t runtime_addr_of_voffset = (uint32_t)(uintptr_t)&STUB_VOFFSET;
     uint32_t load_base = runtime_addr_of_voffset - STUB_VOFFSET;
-    uint32_t convex_base = load_base + CONVEX_MIN_VADDR;
     uint32_t new_oep = load_base + OEP_ADDR;
     uint32_t count = REGION_COUNT;
-    uint32_t prot_count = PROTECTED_COUNT;
     uint32_t i;
     uint32_t dummy;
     int rc;
 
     if (count > STUB_MAX_REGIONS) count = STUB_MAX_REGIONS;
-    if (prot_count > STUB_MAX_REGIONS) prot_count = STUB_MAX_REGIONS;
 
-    /* Phase 1: recover polluted PT_LOAD regions */
+    /* Phase 1: in-place restore of polluted PT_LOAD regions already mapped by OS */
     for (i = 0; i < count; i++) {
         uint32_t region_vaddr  = load_base + REGION_ADDRS[i];
         uint32_t region_size   = REGION_SIZES[i];
         uint32_t retain        = REGION_RETAINS[i];
         uint32_t del           = REGION_DELETES[i];
         uint32_t blocks        = REGION_BLOCKS[i];
-        uint32_t src           = convex_base + REGION_OFFSETS[i];
         uint32_t polluted_size = region_size + blocks * del;
 
         if (!region_size || !retain) continue;
-        if (make_writable(region_vaddr, region_size) != 0) fail_exit(1);
+        if (make_writable(region_vaddr, polluted_size) != 0) fail_exit(1);
 
         rc = compact_in_place(
-            (uint8_t *)src, (uint8_t *)region_vaddr,
+            (uint8_t *)region_vaddr, (uint8_t *)region_vaddr,
             polluted_size, retain, del, blocks,
             (uaddr_t)-1, (uaddr_t *)&dummy
         );
         if (rc != 0) fail_exit(1);
     }
 
-    /* Phase 2: copy protected PT_LOAD regions */
-    for (i = 0; i < prot_count; i++) {
-        uint32_t vaddr = load_base + PROTECTED_ADDRS[i];
-        uint32_t size  = PROTECTED_SIZES[i];
-        uint32_t src   = convex_base + PROTECTED_OFFSETS[i];
-
-        if (!size) continue;
-        if (make_writable(vaddr, size) != 0) fail_exit(1);
-        memcpy_safe((uint8_t *)vaddr, (uint8_t *)src, size);
-    }
-
-    /* Phase 3: recover ELF header */
-    if (HEADER_SIZE && HEADER_RETAIN) {
-        uint32_t hdr_dst      = load_base + HEADER_VADDR;
-        uint32_t hdr_src      = convex_base + HEADER_OFFSET;
-        uint32_t hdr_polluted = HEADER_SIZE + HEADER_BLOCKS * HEADER_DELETE;
-        if (make_writable(hdr_dst, HEADER_SIZE) != 0) fail_exit(1);
-        rc = compact_in_place(
-            (uint8_t *)hdr_src, (uint8_t *)hdr_dst,
-            hdr_polluted, HEADER_RETAIN, HEADER_DELETE, HEADER_BLOCKS,
-            (uaddr_t)-1, (uaddr_t *)&dummy
-        );
-        if (rc != 0) fail_exit(1);
-    }
-
-    /* Phase 4: jump to OEP */
+    /* Phase 2: jump to OEP */
     __asm__ volatile (
         "mov %0, r15\n\t"
         "mov %1, r4\n\t"
@@ -1197,64 +1135,35 @@ static __attribute__((noinline)) void stub_main(uint32_t saved_sp, uint32_t save
                                                 uint32_t saved_d1, uint32_t saved_d2) {
     uint32_t runtime_addr_of_voffset = (uint32_t)(uintptr_t)&STUB_VOFFSET;
     uint32_t load_base = runtime_addr_of_voffset - STUB_VOFFSET;
-    uint32_t convex_base = load_base + CONVEX_MIN_VADDR;
     uint32_t new_oep = load_base + OEP_ADDR;
     uint32_t count = REGION_COUNT;
-    uint32_t prot_count = PROTECTED_COUNT;
     uint32_t i;
     uint32_t dummy;
     int rc;
 
     if (count > STUB_MAX_REGIONS) count = STUB_MAX_REGIONS;
-    if (prot_count > STUB_MAX_REGIONS) prot_count = STUB_MAX_REGIONS;
 
-    /* Phase 1: recover polluted PT_LOAD regions */
+    /* Phase 1: in-place restore of polluted PT_LOAD regions already mapped by OS */
     for (i = 0; i < count; i++) {
         uint32_t region_vaddr  = load_base + REGION_ADDRS[i];
         uint32_t region_size   = REGION_SIZES[i];
         uint32_t retain        = REGION_RETAINS[i];
         uint32_t del           = REGION_DELETES[i];
         uint32_t blocks        = REGION_BLOCKS[i];
-        uint32_t src           = convex_base + REGION_OFFSETS[i];
         uint32_t polluted_size = region_size + blocks * del;
 
         if (!region_size || !retain) continue;
-        if (make_writable(region_vaddr, region_size) != 0) fail_exit(1);
+        if (make_writable(region_vaddr, polluted_size) != 0) fail_exit(1);
 
         rc = compact_in_place(
-            (uint8_t *)src, (uint8_t *)region_vaddr,
+            (uint8_t *)region_vaddr, (uint8_t *)region_vaddr,
             polluted_size, retain, del, blocks,
             (uaddr_t)-1, (uaddr_t *)&dummy
         );
         if (rc != 0) fail_exit(1);
     }
 
-    /* Phase 2: copy protected PT_LOAD regions */
-    for (i = 0; i < prot_count; i++) {
-        uint32_t vaddr = load_base + PROTECTED_ADDRS[i];
-        uint32_t size  = PROTECTED_SIZES[i];
-        uint32_t src   = convex_base + PROTECTED_OFFSETS[i];
-
-        if (!size) continue;
-        if (make_writable(vaddr, size) != 0) fail_exit(1);
-        memcpy_safe((uint8_t *)vaddr, (uint8_t *)src, size);
-    }
-
-    /* Phase 3: recover ELF header */
-    if (HEADER_SIZE && HEADER_RETAIN) {
-        uint32_t hdr_dst      = load_base + HEADER_VADDR;
-        uint32_t hdr_src      = convex_base + HEADER_OFFSET;
-        uint32_t hdr_polluted = HEADER_SIZE + HEADER_BLOCKS * HEADER_DELETE;
-        if (make_writable(hdr_dst, HEADER_SIZE) != 0) fail_exit(1);
-        rc = compact_in_place(
-            (uint8_t *)hdr_src, (uint8_t *)hdr_dst,
-            hdr_polluted, HEADER_RETAIN, HEADER_DELETE, HEADER_BLOCKS,
-            (uaddr_t)-1, (uaddr_t *)&dummy
-        );
-        if (rc != 0) fail_exit(1);
-    }
-
-    /* Phase 4: jump to OEP */
+    /* Phase 2: jump to OEP */
     __asm__ volatile (
         "move.l %0, %%sp\n\t"
         "move.l %1, %%d0\n\t"
@@ -1291,64 +1200,35 @@ static __attribute__((noinline)) void stub_main(uint32_t saved_sp, uint32_t save
                                                 uint32_t saved_a1, uint32_t saved_a2) {
     uint32_t runtime_addr_of_voffset = (uint32_t)(uintptr_t)&STUB_VOFFSET;
     uint32_t load_base = runtime_addr_of_voffset - STUB_VOFFSET;
-    uint32_t convex_base = load_base + CONVEX_MIN_VADDR;
     uint32_t new_oep = load_base + OEP_ADDR;
     uint32_t count = REGION_COUNT;
-    uint32_t prot_count = PROTECTED_COUNT;
     uint32_t i;
     uint32_t dummy;
     int rc;
 
     if (count > STUB_MAX_REGIONS) count = STUB_MAX_REGIONS;
-    if (prot_count > STUB_MAX_REGIONS) prot_count = STUB_MAX_REGIONS;
 
-    /* Phase 1: recover polluted PT_LOAD regions */
+    /* Phase 1: in-place restore of polluted PT_LOAD regions already mapped by OS */
     for (i = 0; i < count; i++) {
         uint32_t region_vaddr  = load_base + REGION_ADDRS[i];
         uint32_t region_size   = REGION_SIZES[i];
         uint32_t retain        = REGION_RETAINS[i];
         uint32_t del           = REGION_DELETES[i];
         uint32_t blocks        = REGION_BLOCKS[i];
-        uint32_t src           = convex_base + REGION_OFFSETS[i];
         uint32_t polluted_size = region_size + blocks * del;
 
         if (!region_size || !retain) continue;
-        if (make_writable(region_vaddr, region_size) != 0) fail_exit(1);
+        if (make_writable(region_vaddr, polluted_size) != 0) fail_exit(1);
 
         rc = compact_in_place(
-            (uint8_t *)src, (uint8_t *)region_vaddr,
+            (uint8_t *)region_vaddr, (uint8_t *)region_vaddr,
             polluted_size, retain, del, blocks,
             (uaddr_t)-1, (uaddr_t *)&dummy
         );
         if (rc != 0) fail_exit(1);
     }
 
-    /* Phase 2: copy protected PT_LOAD regions */
-    for (i = 0; i < prot_count; i++) {
-        uint32_t vaddr = load_base + PROTECTED_ADDRS[i];
-        uint32_t size  = PROTECTED_SIZES[i];
-        uint32_t src   = convex_base + PROTECTED_OFFSETS[i];
-
-        if (!size) continue;
-        if (make_writable(vaddr, size) != 0) fail_exit(1);
-        memcpy_safe((uint8_t *)vaddr, (uint8_t *)src, size);
-    }
-
-    /* Phase 3: recover ELF header */
-    if (HEADER_SIZE && HEADER_RETAIN) {
-        uint32_t hdr_dst      = load_base + HEADER_VADDR;
-        uint32_t hdr_src      = convex_base + HEADER_OFFSET;
-        uint32_t hdr_polluted = HEADER_SIZE + HEADER_BLOCKS * HEADER_DELETE;
-        if (make_writable(hdr_dst, HEADER_SIZE) != 0) fail_exit(1);
-        rc = compact_in_place(
-            (uint8_t *)hdr_src, (uint8_t *)hdr_dst,
-            hdr_polluted, HEADER_RETAIN, HEADER_DELETE, HEADER_BLOCKS,
-            (uaddr_t)-1, (uaddr_t *)&dummy
-        );
-        if (rc != 0) fail_exit(1);
-    }
-
-    /* Phase 4: jump to OEP */
+    /* Phase 2: jump to OEP */
     __asm__ volatile (
         "move $sp, %0\n\t"
         "move $4, %1\n\t"
@@ -1386,10 +1266,8 @@ static __attribute__((noinline)) void stub_main(uint32_t saved_r1, uint32_t save
                                                 uint32_t saved_r4, uint32_t saved_r5) {
     uint32_t runtime_addr_of_voffset = (uint32_t)(uintptr_t)&STUB_VOFFSET;
     uint32_t load_base = runtime_addr_of_voffset - STUB_VOFFSET;
-    uint32_t convex_base = load_base + CONVEX_MIN_VADDR;
     uint32_t new_oep = load_base + OEP_ADDR;
     uint32_t count = REGION_COUNT;
-    uint32_t prot_count = PROTECTED_COUNT;
     uint32_t i;
     uint32_t dummy;
     int rc;
@@ -1400,55 +1278,28 @@ static __attribute__((noinline)) void stub_main(uint32_t saved_r1, uint32_t save
     SAVED_R5 = saved_r5;
 
     if (count > STUB_MAX_REGIONS) count = STUB_MAX_REGIONS;
-    if (prot_count > STUB_MAX_REGIONS) prot_count = STUB_MAX_REGIONS;
 
-    /* Phase 1: recover polluted PT_LOAD regions */
+    /* Phase 1: in-place restore of polluted PT_LOAD regions already mapped by OS */
     for (i = 0; i < count; i++) {
         uint32_t region_vaddr  = load_base + REGION_ADDRS[i];
         uint32_t region_size   = REGION_SIZES[i];
         uint32_t retain        = REGION_RETAINS[i];
         uint32_t del           = REGION_DELETES[i];
         uint32_t blocks        = REGION_BLOCKS[i];
-        uint32_t src           = convex_base + REGION_OFFSETS[i];
         uint32_t polluted_size = region_size + blocks * del;
 
         if (!region_size || !retain) continue;
-        if (make_writable(region_vaddr, region_size) != 0) fail_exit(1);
+        if (make_writable(region_vaddr, polluted_size) != 0) fail_exit(1);
 
         rc = compact_in_place(
-            (uint8_t *)src, (uint8_t *)region_vaddr,
+            (uint8_t *)region_vaddr, (uint8_t *)region_vaddr,
             polluted_size, retain, del, blocks,
             (uaddr_t)-1, (uaddr_t *)&dummy
         );
         if (rc != 0) fail_exit(1);
     }
 
-    /* Phase 2: copy protected PT_LOAD regions */
-    for (i = 0; i < prot_count; i++) {
-        uint32_t vaddr = load_base + PROTECTED_ADDRS[i];
-        uint32_t size  = PROTECTED_SIZES[i];
-        uint32_t src   = convex_base + PROTECTED_OFFSETS[i];
-
-        if (!size) continue;
-        if (make_writable(vaddr, size) != 0) fail_exit(1);
-        memcpy_safe((uint8_t *)vaddr, (uint8_t *)src, size);
-    }
-
-    /* Phase 3: recover ELF header */
-    if (HEADER_SIZE && HEADER_RETAIN) {
-        uint32_t hdr_dst      = load_base + HEADER_VADDR;
-        uint32_t hdr_src      = convex_base + HEADER_OFFSET;
-        uint32_t hdr_polluted = HEADER_SIZE + HEADER_BLOCKS * HEADER_DELETE;
-        if (make_writable(hdr_dst, HEADER_SIZE) != 0) fail_exit(1);
-        rc = compact_in_place(
-            (uint8_t *)hdr_src, (uint8_t *)hdr_dst,
-            hdr_polluted, HEADER_RETAIN, HEADER_DELETE, HEADER_BLOCKS,
-            (uaddr_t)-1, (uaddr_t *)&dummy
-        );
-        if (rc != 0) fail_exit(1);
-    }
-
-    /* Phase 4: jump to OEP */
+    /* Phase 2: jump to OEP */
     __asm__ volatile (
         "mr 1, %0\n\t"
         "mr 3, %1\n\t"
