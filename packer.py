@@ -11,6 +11,7 @@ ELF 打包器：凸包模式（UPX 风格）
 
 import argparse
 import json
+import os
 import random
 import subprocess
 import shutil
@@ -490,8 +491,10 @@ def build_polluted_text(old_text: bytes, block_size: int, insert_size: int, inse
         fill = b'\x00' * insert_size
     elif insert_type == 'nop':
         fill = nop_bytes(arch_name, insert_size)
+    elif insert_type == 'junk':
+        fill = os.urandom(insert_size)
     else:
-        raise ValueError("insert_type 必须是 zero 或 nop")
+        raise ValueError("insert_type 必须是 zero、nop 或 junk")
 
     new_content = bytearray()
     pos = 0
@@ -1544,17 +1547,13 @@ def pack_with_convex_hull(target_file: Path,
                           block_size: int,
                           insert_size: int,
                           insert_type: str,
-                          strip_recoverable_plaintext: bool,
-                          prune_recoverable_bytes: bool,
-                          prune_recoverable_pages: bool,
                           machine_override: int | None,
                           stub_path_override: str,
                           stub_source_override: str,
                           auto_build_stub: bool,
                           rebuild_stub: bool,
                           stub_compilers: dict[str, str],
-                          stub_build_timeout: int,
-                          verify_recovery: bool) -> tuple[bool, dict]:
+                          stub_build_timeout: int) -> tuple[bool, dict]:
     """
     使用凸包方式打包 ELF
     """
@@ -1568,14 +1567,10 @@ def pack_with_convex_hull(target_file: Path,
         'block_size': int(block_size),
         'insert_size': int(insert_size),
         'insert_type': str(insert_type),
-        'strip_recoverable_plaintext': bool(strip_recoverable_plaintext),
-        'prune_recoverable_bytes': bool(prune_recoverable_bytes),
-        'prune_recoverable_pages': bool(prune_recoverable_pages),
         'machine_override': machine_override,
         'stub_path_override': stub_path_override,
         'stub_source_override': stub_source_override,
         'stub_build_timeout': int(stub_build_timeout),
-        'verify_recovery': bool(verify_recovery),
     }
 
     def fail(error: str) -> tuple[bool, dict]:
@@ -1946,13 +1941,7 @@ def main():
     parser.add_argument('--overwrite', action='store_true', help='覆盖已存在文件')
     parser.add_argument('--block-size', type=int, default=32, help='原始块大小（字节）')
     parser.add_argument('--insert-size', type=int, default=64, help='插入块大小（字节）')
-    parser.add_argument('--insert-type', choices=['zero', 'nop'], default='nop', help='插入内容类型')
-    parser.add_argument('--keep-recoverable-plaintext', action='store_true',
-                        help='保留原可恢复段明文字节（默认会裁剪去除，更接近 UPX）')
-    parser.add_argument('--prune-recoverable-bytes', action='store_true',
-                        help='启用非页粒度裁剪（精确删除可恢复段字节，不可裁剪时回退）')
-    parser.add_argument('--prune-recoverable-pages', action='store_true',
-                        help='启用页级裁剪（按 0x1000 页重排），不可裁剪时回退为明文覆写')
+    parser.add_argument('--insert-type', choices=['zero', 'nop', 'junk'], default='nop', help='插入内容类型（zero=全零, nop=NOP指令, junk=随机字节）')
     parser.add_argument('--machine', default='',
                         help='覆盖目标 e_machine（如 x86_64/i386/arm/aarch64/mips/ppc/sparc/sh/m68k/or1k/arc/xtensa/nios2，或数值如 62）')
     parser.add_argument('--stub-path', default='',
@@ -1976,11 +1965,9 @@ def main():
     parser.add_argument('--stub-cc32', default='', help=argparse.SUPPRESS)
     parser.add_argument('--status-json', default='',
                         help='将处理状态写入 JSON 文件（包含每个文件的统计信息）')
-    parser.add_argument('--no-verify-recovery', action='store_true', help='关闭恢复一致性校验')
     
     args = parser.parse_args()
     
-    verify_recovery = not args.no_verify_recovery
     try:
         machine_override = parse_machine_arg(args.machine)
     except Exception as e:
@@ -2009,14 +1996,11 @@ def main():
         ok, rec = pack_with_convex_hull(
             target_file, output_file, temp_file,
             args.block_size, args.insert_size, args.insert_type,
-            not args.keep_recoverable_plaintext,
-            args.prune_recoverable_bytes,
-            args.prune_recoverable_pages,
             machine_override,
             args.stub_path,
             args.stub_source,
             args.auto_build_stub, args.rebuild_stub,
-            stub_compilers, args.stub_build_timeout, verify_recovery
+            stub_compilers, args.stub_build_timeout
         )
         
         if temp_file.exists():
@@ -2081,14 +2065,11 @@ def main():
             succ, rec = pack_with_convex_hull(
                 p, out_path, temp_path,
                 args.block_size, args.insert_size, args.insert_type,
-                not args.keep_recoverable_plaintext,
-                args.prune_recoverable_bytes,
-                args.prune_recoverable_pages,
                 machine_override,
                 args.stub_path,
                 args.stub_source,
                 args.auto_build_stub, args.rebuild_stub,
-                stub_compilers, args.stub_build_timeout, verify_recovery
+                stub_compilers, args.stub_build_timeout
             )
             results.append(rec)
             if succ:
