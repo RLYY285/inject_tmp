@@ -724,7 +724,7 @@ static __attribute__((noinline)) void stub_main(void) {
 
     /* Phase 1: read polluted PT_LOAD data from disk, restore, map at original VA */
     long exe_fd = my_syscall3(SYS_OPEN, (long)(uintptr_t)SELF_EXE_PATH, 0L, 0L);
-    if (exe_fd < 0) fail_exit(6);
+    if (exe_fd < 0) fail_exit(6); /* 6: open /proc/self/exe failed */
 
     for (i = 0; i < count; i++) {
         uaddr_t region_vaddr  = load_base + REGION_ADDRS[i];
@@ -738,8 +738,8 @@ static __attribute__((noinline)) void stub_main(void) {
         if (!region_size || !retain) continue;
 
         uaddr_t read_buf = alloc_temp(polluted_size);
-        if (my_syscall3(SYS_LSEEK, exe_fd, (long)file_offset, 0L) < 0) fail_exit(7);
-        if (my_read_all(exe_fd, (uint8_t *)read_buf, polluted_size) != polluted_size) fail_exit(8);
+        if (my_syscall3(SYS_LSEEK, exe_fd, (long)file_offset, 0L) < 0) fail_exit(7); /* 7: lseek failed */
+        if (my_read_all(exe_fd, (uint8_t *)read_buf, polluted_size) != polluted_size) fail_exit(8); /* 8: short read */
 
         uaddr_t out_buf = alloc_temp(region_size);
         rc = compact_in_place(
@@ -1153,6 +1153,7 @@ static __attribute__((noinline)) void stub_main(uint32_t saved_sp, uint32_t save
         uint32_t polluted_size = region_size + blocks * del;
 
         if (!region_size || !retain) continue;
+        /* polluted_size bytes are mapped by OS (p_memsz >= polluted_size set by packer) */
         if (make_writable(region_vaddr, polluted_size) != 0) fail_exit(1);
 
         rc = compact_in_place(
