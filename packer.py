@@ -1740,6 +1740,12 @@ def pack_with_convex_hull(target_file: Path,
     status['recoverable_segments'] = int(len(recoverable_infos))
     status['protected_segments'] = int(len(protected_infos))
 
+    if len(recoverable_infos) == 0:
+        msg = '可污染段为 0，跳过处理'
+        print(f'   [跳过] {msg}')
+        status['no_pollutable_segments'] = True
+        return False, status
+
     # 写修改后的字节到临时文件
     temp_modified_file = Path(str(temp_file) + '.inplace')
     try:
@@ -2155,6 +2161,8 @@ def main():
             results.append(rec)
             if succ:
                 ok += 1
+            elif rec.get('no_pollutable_segments'):
+                pass  # 可污染段为 0，不计入 ok 也不计入 skipped
             else:
                 skipped += 1
         except Exception as e:
